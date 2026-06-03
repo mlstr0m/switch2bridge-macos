@@ -26,7 +26,7 @@ OPTIONS = {
         'NSAccessibilityUsageDescription': 
             'Switch2 Bridge needs accessibility access to simulate keyboard input for games.',
     },
-    'packages': ['bleak', 'pynput', 'rumps', 'asyncio', 'objc'],
+    'packages': ['bleak', 'pynput', 'rumps', 'objc'],
     'includes': ['Foundation', 'AppKit', 'CoreBluetooth'],
 }
 

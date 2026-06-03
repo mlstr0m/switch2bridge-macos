@@ -1,12 +1,8 @@
-# 🎮 Switch 2 Pro Controller - macOS BLE Bridge
+# 🎮 Switch 2 Pro Controller — macOS BLE Bridge
 
 **The first working Bluetooth LE client for the Nintendo Switch 2 Pro Controller on macOS.**
 
-A Python-based bridge that connects to the Switch 2 Pro Controller via BLE and translates inputs to keyboard presses for use with emulators like Ryujinx.
-
-<p align="center">
-  <img src="assets/demo.gif" alt="Demo" width="600">
-</p>
+A Python menubar app that connects to the Switch 2 Pro Controller via BLE and translates inputs to keyboard presses for use with emulators like Ryujinx.
 
 [![macOS](https://img.shields.io/badge/macOS-Ventura%2B-blue?logo=apple)](https://www.apple.com/macos)
 [![Python](https://img.shields.io/badge/Python-3.9%2B-green?logo=python)](https://python.org)
@@ -25,11 +21,11 @@ A Python-based bridge that connects to the Switch 2 Pro Controller via BLE and t
 
 ## 🚀 Features
 
-- ✅ **Full button mapping** - All buttons, triggers, D-pad working
-- ✅ **Analog sticks** - Both sticks with 12-bit precision
-- ✅ **Grip buttons** - Switch 2 exclusive GL/GR buttons supported
-- ✅ **Ryujinx compatible** - Keyboard bridge for emulator support
-- ✅ **No pairing required** - Bypasses macOS Bluetooth limitations
+- ✅ **Full button mapping** — all buttons, triggers, D-pad working
+- ✅ **Analog sticks** — read with 12-bit precision (converted to 8 directions, see Limitations)
+- ✅ **Grip buttons** — Switch 2 exclusive GL/GR buttons supported
+- ✅ **Ryujinx compatible** — keyboard bridge for emulator support
+- ✅ **No pairing required** — bypasses macOS Bluetooth limitations
 
 ## 🤔 Why This Exists
 
@@ -49,51 +45,50 @@ This bridge connects via BLE using the `bleak` library, reads the raw input data
 - Python 3.9+
 - Nintendo Switch 2 Pro Controller
 
-## 🔧 Installation
+## 🔧 Run from source
 
 ```bash
-# Clone the repository
-git clone https://github.com/AurelienDesert/switch2-mac-bridge.git
-cd switch2-mac-bridge
+git clone https://github.com/mlstr0m/switch2bridge-macos.git
+cd switch2bridge-macos
 
-# Create virtual environment
 python3 -m venv venv
 source venv/bin/activate
-
-# Install dependencies
 pip install -r requirements.txt
+
+python Switch2Bridge.py
+```
+
+On first launch, macOS will prompt for:
+1. **Bluetooth** — to connect to the controller
+2. **Accessibility** — to simulate keyboard input
+
+Grant both in `System Settings → Privacy & Security`.
+
+## 📦 Build a standalone .app + DMG
+
+```bash
+chmod +x build_dmg.sh
+./build_dmg.sh
+```
+
+The installer lands at `dist/Switch2Bridge-Installer.dmg`. Manual build:
+
+```bash
+python setup_app.py py2app
+# → dist/Switch2 Bridge.app
 ```
 
 ## 🎯 Usage
 
-### Option 1: Raw Input Display (for testing)
-
-```bash
-python src/client.py
-```
-
-Displays all controller inputs in real-time. Great for verifying your controller works.
-
-### Option 2: Ryujinx Keyboard Bridge (for gaming)
-
-```bash
-python src/ryujinx_bridge.py
-```
-
-Converts controller inputs to keyboard presses for use with Ryujinx.
-
-**⚠️ First run:** macOS will ask for Accessibility permissions. Grant access in:
-> System Preferences → Security & Privacy → Privacy → Accessibility
-
-**Ryujinx Configuration:**
-1. Open Ryujinx → Options → Settings → Input
-2. Set Input Device: **Keyboard**
-3. Set Controller Type: **Pro Controller**
-4. Map each button according to the table below
+1. Launch the app — a 🎮 appears in the menu bar
+2. Click → **Connect Controller**
+3. Wait for 🟢 (connected)
+4. Open Ryujinx → Options → Settings → Input
+   - Input Device: **Keyboard**
+   - Controller Type: **Pro Controller**
+   - Map keys using the table below
 
 ## 🎮 Button Mapping
-
-### Controller → Keyboard (Ryujinx Bridge)
 
 | Button | Key | | Button | Key |
 |--------|-----|-|--------|-----|
@@ -116,14 +111,11 @@ Converts controller inputs to keyboard presses for use with Ryujinx.
 ## 📁 Project Structure
 
 ```
-switch2-mac-bridge/
-├── src/
-│   ├── client.py           # BLE client (raw input display)
-│   ├── ryujinx_bridge.py   # Keyboard bridge for Ryujinx
-│   └── calibrate.py        # Calibration utility
-├── docs/
-│   └── PROTOCOL.md         # BLE protocol documentation
-├── requirements.txt
+switch2bridge-macos/
+├── Switch2Bridge.py    # Menubar app (BLE client + keyboard bridge)
+├── setup_app.py        # py2app configuration
+├── build_dmg.sh        # Automated build script (.app + DMG)
+├── requirements.txt    # Python dependencies
 ├── LICENSE
 └── README.md
 ```
@@ -139,26 +131,24 @@ switch2-mac-bridge/
 └─────────────────┘              └─────────────────┘              └─────────────────┘
 ```
 
-1. **BLE Connection**: Uses `bleak` to connect directly via Bluetooth LE
-2. **Input Parsing**: Decodes the proprietary Nintendo protocol
-3. **Keyboard Simulation**: Uses `pynput` to simulate key presses
-4. **Ryujinx**: Reads keyboard input as if from a physical keyboard
+1. **BLE Connection** — uses `bleak` to connect directly via Bluetooth LE
+2. **Input Parsing** — decodes the proprietary Nintendo protocol
+3. **Keyboard Simulation** — uses `pynput` to simulate key presses
+4. **Ryujinx** — reads keyboard input as if from a physical keyboard
 
 ### BLE Characteristics
 
 | UUID | Purpose |
 |------|---------|
 | `7492866c-ec3e-4619-8258-32755ffcc0f9` | Input reports (notifications) |
-| `7492866c-ec3e-4619-8258-32755ffcc0f8` | Output (LED, rumble - not working) |
-
-See [docs/PROTOCOL.md](docs/PROTOCOL.md) for full protocol documentation.
+| `7492866c-ec3e-4619-8258-32755ffcc0f8` | Output (LED, rumble — not working) |
 
 ## 🚧 Limitations
 
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Buttons | ✅ Working | All buttons mapped |
-| Analog Sticks | ⚠️ Digital | Converted to 8 directions (WASD/IJKL) |
+| Analog Sticks | ⚠️ Digital | Read at 12-bit, then thresholded to 8 directions (WASD/IJKL). True analog would require a virtual HID device (DriverKit). |
 | LED Control | ❌ Not working | Output characteristic doesn't respond |
 | Rumble | ❌ Not working | Same issue |
 | Motion/Gyro | ❌ Not implemented | Data not decoded |
@@ -168,25 +158,25 @@ See [docs/PROTOCOL.md](docs/PROTOCOL.md) for full protocol documentation.
 
 Contributions welcome! Areas that need work:
 
-1. **LED/Rumble** - Figure out the output protocol
-2. **Motion controls** - Decode gyro/accelerometer data  
-3. **True analog** - Virtual HID device (requires DriverKit)
-4. **Cross-platform** - Linux/Windows ports
+1. **LED/Rumble** — figure out the output protocol (likely a Joy-Con-style handshake)
+2. **Motion controls** — decode gyro/accelerometer data
+3. **True analog** — virtual HID device via DriverKit
+4. **Cross-platform** — Linux/Windows ports
 
 ## 📜 Credits
 
-- **Aurélien Desert** - Reverse engineering & implementation
-- **Claude (Anthropic)** - Development assistance
+- **Aurélien Desert** — reverse engineering & implementation
+- **Claude (Anthropic)** — development assistance
 - Inspired by [SPro2Win](https://github.com/SquareDonut1/SPro2Win) (Windows)
 - Protocol reference from [Nintendo Switch Reverse Engineering](https://github.com/dekuNukem/Nintendo_Switch_Reverse_Engineering)
 
 ## 📄 License
 
-MIT License - See [LICENSE](LICENSE) for details.
+MIT License — see [LICENSE](LICENSE) for details.
 
 ---
 
 <p align="center">
   <b>⭐ Star this repo if it helped you!</b><br>
-  <i>First macOS BLE bridge for Switch 2 Pro Controller - January 2026</i>
+  <i>First macOS BLE bridge for Switch 2 Pro Controller — January 2026</i>
 </p>
