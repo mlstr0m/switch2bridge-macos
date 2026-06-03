@@ -132,6 +132,7 @@ switch2bridge-macos/
 ├── setup_app.py        # py2app configuration
 ├── build_dmg.sh        # Automated build script (.app + DMG)
 ├── requirements.txt    # Python dependencies
+├── AppIcon.icns        # Application icon (used by py2app)
 ├── LICENSE
 └── README.md
 ```
@@ -158,6 +159,12 @@ switch2bridge-macos/
 |------|---------|
 | `7492866c-ec3e-4619-8258-32755ffcc0f9` | Input reports (notifications) |
 | `7492866c-ec3e-4619-8258-32755ffcc0f8` | Output (LED, rumble — not working) |
+
+## 🩺 Troubleshooting
+
+- **"Controller not found"** — make sure the Switch 2 Pro Controller is on and not paired with a console. Hold the small pair button on the back until the LEDs cycle, then click **Connect Controller** again.
+- **Menubar says 🟢 connected but inputs don't reach the emulator** — macOS Accessibility permission is missing. Grant it in *System Settings → Privacy & Security → Accessibility*, then relaunch the app. (The app should also pop an alert about this on first launch.)
+- **Logs** — written to `~/Library/Logs/Switch2Bridge/bridge.log`. Open a terminal and `tail -f` it to watch what's happening in real time.
 
 ## 🚧 Limitations
 

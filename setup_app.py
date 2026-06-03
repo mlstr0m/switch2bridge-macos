@@ -8,15 +8,18 @@ Usage:
 from setuptools import setup
 
 APP = ['Switch2Bridge.py']
+ICON = 'AppIcon.icns'
 
 OPTIONS = {
     'argv_emulation': False,
+    'iconfile': ICON,
     'plist': {
         'CFBundleName': 'Switch2 Bridge',
         'CFBundleDisplayName': 'Switch2 Bridge',
         'CFBundleIdentifier': 'com.aureliendesert.switch2bridge',
         'CFBundleVersion': '1.0.0',
         'CFBundleShortVersionString': '1.0.0',
+        'CFBundleIconFile': 'AppIcon',
         'LSMinimumSystemVersion': '13.0',
         'LSUIElement': True,  # Menubar only, no dock icon
         'NSBluetoothAlwaysUsageDescription': 
