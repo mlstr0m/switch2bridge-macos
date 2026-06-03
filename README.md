@@ -132,6 +132,7 @@ switch2bridge-macos/
 ├── setup_app.py        # py2app configuration
 ├── build_dmg.sh        # Automated build script (.app + DMG)
 ├── requirements.txt    # Python dependencies
+├── AppIcon.icns        # Application icon (used by py2app)
 ├── LICENSE
 └── README.md
 ```

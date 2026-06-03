@@ -1,6 +1,6 @@
-# On ignore les dossiers de build et de distribution
-app/dist/
-app/build/
+# Build & distribution
+dist/
+build/
 *.spec
 
 # On ignore tous les fichiers de cache Python
