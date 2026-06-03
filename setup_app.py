@@ -27,7 +27,7 @@ OPTIONS = {
             'Switch2 Bridge needs accessibility access to simulate keyboard input for games.',
     },
     'packages': ['bleak', 'pynput', 'rumps', 'objc'],
-    'includes': ['Foundation', 'AppKit', 'CoreBluetooth'],
+    'includes': ['Foundation', 'AppKit', 'CoreBluetooth', 'ApplicationServices'],
 }
 
 setup(
