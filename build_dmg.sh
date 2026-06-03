@@ -38,7 +38,7 @@ fi
 source venv/bin/activate
 
 pip install --upgrade pip -q
-pip install bleak pynput rumps py2app -q
+pip install -r requirements.txt -q
 
 echo "   ✓ Dependencies installed"
 

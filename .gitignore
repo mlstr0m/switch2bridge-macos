@@ -1,3 +1,12 @@
+# On ignore les dossiers de build et de distribution
+app/dist/
+app/build/
+*.spec
+
+# On ignore tous les fichiers de cache Python
+**/__pycache__/
+*.pyc
+
 # Fichiers système macOS
 .DS_Store
 .AppleDouble
@@ -13,11 +22,3 @@ env/
 # IDE (Visual Studio Code, etc.)
 .vscode/
 .idea/
-# On ignore les dossiers de build et de distribution
-app/dist/
-app/build/
-*.spec
-
-# On ignore tous les fichiers de cache Python
-**/__pycache__/
-*.pyc
