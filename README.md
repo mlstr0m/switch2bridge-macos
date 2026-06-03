@@ -90,6 +90,8 @@ python setup_app.py py2app
 
 ## 🎮 Button Mapping
 
+Default mapping:
+
 | Button | Key | | Button | Key |
 |--------|-----|-|--------|-----|
 | A | Z | | L | Q |
@@ -107,6 +109,20 @@ python setup_app.py py2app
 | Down | ↓ | | Right Stick | IJKL |
 | Left | ← | | | |
 | Right | → | | | |
+
+### Custom mappings
+
+The first time you launch the app it writes a JSON config to:
+
+```
+~/Library/Application Support/Switch2Bridge/mappings.json
+```
+
+Edit it to remap any button or stick direction, then **Reload mappings** from the menubar (or restart the app). The menubar also has **Edit mappings file…** which reveals the file in Finder.
+
+Each value is either a single character (`"a"`, `"5"`, `"."`) or a named key in angle brackets: `<up>`, `<down>`, `<left>`, `<right>`, `<space>`, `<enter>`, `<esc>`, `<tab>`, `<backspace>`, `<shift>`, `<ctrl>`, `<alt>`, `<cmd>`.
+
+Invalid JSON falls back to defaults and the menubar surfaces the parse error.
 
 ## 📁 Project Structure
 
