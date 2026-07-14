@@ -5,10 +5,17 @@ Usage:
     python setup_app.py py2app
 """
 
+import re
+
 from setuptools import setup
 
 APP = ['Switch2Bridge.py']
 ICON = 'AppIcon.icns'
+
+# Single source of truth for the version (avoids importing the app module,
+# which has import-time side effects)
+with open('Switch2Bridge.py') as f:
+    VERSION = re.search(r'^APP_VERSION = "(.+)"', f.read(), re.M).group(1)
 
 OPTIONS = {
     'argv_emulation': False,
@@ -17,8 +24,8 @@ OPTIONS = {
         'CFBundleName': 'Switch2 Bridge',
         'CFBundleDisplayName': 'Switch2 Bridge',
         'CFBundleIdentifier': 'com.aureliendesert.switch2bridge',
-        'CFBundleVersion': '1.2.0',
-        'CFBundleShortVersionString': '1.2.0',
+        'CFBundleVersion': VERSION,
+        'CFBundleShortVersionString': VERSION,
         'CFBundleIconFile': 'AppIcon',
         'LSMinimumSystemVersion': '13.0',
         'LSUIElement': True,  # Menubar only, no dock icon
@@ -31,7 +38,7 @@ OPTIONS = {
     },
     'packages': ['bleak', 'pynput', 'rumps', 'objc'],
     'includes': ['Foundation', 'AppKit', 'CoreBluetooth', 'ApplicationServices',
-                 'dsu_server'],
+                 'ServiceManagement', 'dsu_server'],
 }
 
 setup(

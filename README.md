@@ -30,6 +30,7 @@ A Python menubar app that connects to the Switch 2 Pro Controller via BLE and tr
 - ✅ **Auto-reconnect** — if the controller sleeps or drops, the bridge retries for 60 s
 - ✅ **C button** — the Switch 2's new C button can be mapped (experimental)
 - ✅ **DSU server (cemuhook)** — true **analog sticks** in Dolphin, Cemu & other DSU clients, no driver needed
+- ✅ **Start at Login** — one click in the menubar (bundled .app, macOS 13+)
 
 ## 🤔 Why This Exists
 

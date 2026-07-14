@@ -54,12 +54,19 @@ except ImportError:
 
 from dsu_server import DSUServer
 
+SMAppService = None
+try:
+    from ServiceManagement import SMAppService
+except ImportError:
+    pass  # "Start at Login" simply won't be offered
+
 
 # ============================================================
 # CONSTANTS
 # ============================================================
 
 APP_NAME = "Switch2 Bridge"
+APP_VERSION = "1.2.0"  # single source of truth — read by setup_app.py & build_dmg.sh
 INPUT_CHAR_UUID = "7492866c-ec3e-4619-8258-32755ffcc0f9"
 
 # Bluetooth SIG company identifier for Nintendo
@@ -671,7 +678,9 @@ class Switch2BridgeApp(rumps.App):
         self._reveal_item = rumps.MenuItem("Edit mappings file…", callback=self._reveal_mappings)
         self._reload_item = rumps.MenuItem("Reload mappings", callback=self._reload_mappings)
         self._dsu_item = rumps.MenuItem("DSU server", callback=self._toggle_dsu)
+        self._login_item = rumps.MenuItem("Start at Login", callback=self._toggle_login)
         self._logs_item = rumps.MenuItem("Open logs…", callback=self._open_logs)
+        self._version_item = rumps.MenuItem(f"{APP_NAME} v{APP_VERSION}")
         self._quit_item = rumps.MenuItem("Quit", callback=self._on_quit)
 
         self.menu = [
@@ -685,11 +694,17 @@ class Switch2BridgeApp(rumps.App):
             self._reload_item,
             None,
             self._dsu_item,
+            self._login_item,
             self._logs_item,
             None,
+            self._version_item,
             self._quit_item,
         ]
         self._sync_dsu()
+        self._sync_login_item()
+        # packets/s: sampled by the UI tick
+        self._rate_prev_count = 0
+        self._rate_prev_time = time.monotonic()
 
         self._last_state = None
         self._accessibility_checked = False
@@ -782,7 +797,12 @@ class Switch2BridgeApp(rumps.App):
             self._apply_state(state)
         elif state == 'connected':
             # in-place title update — no menu rebuild
-            detail = f"   {self.bridge.packet_count} packets"
+            count = self.bridge.packet_count
+            now = time.monotonic()
+            elapsed = now - self._rate_prev_time
+            rate = max(0.0, (count - self._rate_prev_count) / elapsed) if elapsed > 0 else 0.0
+            self._rate_prev_count, self._rate_prev_time = count, now
+            detail = f"   {count} pkts · {rate:.0f}/s"
             if self.dsu.running:
                 n = self.dsu.client_count()
                 if n:
@@ -867,6 +887,50 @@ class Switch2BridgeApp(rumps.App):
         else:
             self._dsu_item.title = "DSU server"
             self._dsu_item.state = 0
+
+    def _login_service(self):
+        """SMAppService for the main app, or None when unavailable.
+
+        Registration only works from a bundled .app (py2app sets sys.frozen),
+        and needs the pyobjc ServiceManagement framework (macOS 13+).
+        """
+        if SMAppService is None or not getattr(sys, "frozen", False):
+            return None
+        try:
+            return SMAppService.mainAppService()
+        except Exception:
+            log.exception("SMAppService unavailable")
+            return None
+
+    def _sync_login_item(self):
+        svc = self._login_service()
+        if svc is None:
+            self._login_item.set_callback(None)  # disabled outside a bundled .app
+            self._login_item.state = 0
+            return
+        self._login_item.set_callback(self._toggle_login)
+        self._login_item.state = 1 if svc.status() == 1 else 0  # 1 = enabled
+
+    def _toggle_login(self, _):
+        svc = self._login_service()
+        if svc is None:
+            return
+        try:
+            if svc.status() == 1:
+                res = svc.unregisterAndReturnError_(None)
+            else:
+                res = svc.registerAndReturnError_(None)
+            ok, err = res if isinstance(res, tuple) else (res, None)
+            if not ok:
+                raise RuntimeError(err)
+        except Exception as e:
+            log.exception("login item toggle failed")
+            rumps.alert(
+                title=APP_NAME,
+                message=f"Could not update the login item: {e}",
+                ok="OK",
+            )
+        self._sync_login_item()
 
     def _open_logs(self, _):
         try:
