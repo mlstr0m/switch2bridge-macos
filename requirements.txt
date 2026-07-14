@@ -1,6 +1,7 @@
 # Switch2 Bridge - Dependencies
 
 bleak>=0.21.0      # BLE connection
-pynput>=1.7.6      # Keyboard simulation  
+pynput>=1.7.6      # Keyboard simulation
 rumps>=0.4.0       # Menubar app
 py2app>=0.28.0     # Build .app
+pyobjc-framework-ServiceManagement>=9.0   # "Start at Login" (SMAppService)

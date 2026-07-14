@@ -7,7 +7,7 @@ set -e
 
 APP_NAME="Switch2 Bridge"
 DMG_NAME="Switch2Bridge-Installer"
-VERSION="1.1.0"
+VERSION=$(sed -n 's/^APP_VERSION = "\(.*\)".*/\1/p' Switch2Bridge.py)
 
 echo ""
 echo "╔═══════════════════════════════════════════════════════════╗"
