@@ -28,6 +28,7 @@ A Python menubar app that connects to the Switch 2 Pro Controller via BLE and tr
 - ✅ **No pairing required** — bypasses macOS Bluetooth limitations
 - ✅ **Auto-reconnect** — if the controller sleeps or drops, the bridge retries for 60 s
 - ✅ **C button** — the Switch 2's new C button can be mapped (experimental)
+- ✅ **DSU server (cemuhook)** — true **analog sticks** in Dolphin, Cemu & other DSU clients, no driver needed
 
 ## 🤔 Why This Exists
 
@@ -128,11 +129,28 @@ The Switch 2's new **C button** is supported as `"C"` (unmapped by default — s
 
 Invalid JSON falls back to defaults and the menubar surfaces the parse error. Unknown button names or stick directions (typos) are reported via a notification instead of being silently ignored. Two inputs may share the same key: the key is only released once both are released.
 
+## 🕹️ DSU server — true analog sticks (no driver)
+
+The app runs a [cemuhook/DSU](https://github.com/v1993/cemuhook-protocol) server (default `127.0.0.1:26760`), which exposes the controller as a full gamepad over UDP — **analog sticks included**, bypassing the keyboard bridge's 8-direction limitation.
+
+- **Dolphin** — Options → Controller Settings → *Alternate Input Sources* → enable *DSU Client*, add `127.0.0.1:26760`. The pad then appears as an input device with analog axes.
+- **Cemu** — Input settings → add a *DSUController* with the same address.
+- **Ryujinx** — uses DSU for **motion only** (Settings → Input → enable *Motion* → *Use CemuHook compatible motion*). Buttons/sticks still go through the keyboard bridge. Motion data itself is not decoded yet (sent as zeros).
+
+Configure in `mappings.json`:
+
+```json
+"dsu": { "enabled": true, "host": "127.0.0.1", "port": 26760 }
+```
+
+or toggle it from the menubar (**DSU server** item — the checkmark shows it's listening). Button mapping on the DSU side is positional: A→Circle, B→Cross, X→Triangle, Y→Square, −→Share, +→Options, Home→PS, Capture→Touch. GL/GR/C have no DSU equivalent.
+
 ## 📁 Project Structure
 
 ```
 switch2bridge-macos/
 ├── Switch2Bridge.py    # Menubar app (BLE client + keyboard bridge)
+├── dsu_server.py       # DSU (cemuhook) server — analog output for emulators
 ├── setup_app.py        # py2app configuration
 ├── build_dmg.sh        # Automated build script (.app + DMG)
 ├── requirements.txt    # Python dependencies
@@ -178,10 +196,10 @@ switch2bridge-macos/
 |---------|--------|-------|
 | Buttons | ✅ Working | All buttons mapped |
 | C button | 🧪 Experimental | Parsed as byte 4, bit `0x02` — please report if it doesn't fire |
-| Analog Sticks | ⚠️ Digital | Read at 12-bit, then thresholded (with hysteresis to avoid chatter) to 8 directions (WASD/IJKL). True analog would require a virtual HID device (DriverKit). |
+| Analog Sticks | ✅ Analog via DSU | Full 12-bit analog through the DSU server (Dolphin/Cemu). The keyboard bridge remains digital: thresholded (with hysteresis) to 8 directions (WASD/IJKL). |
 | LED Control | ❌ Not working | Output characteristic doesn't respond |
 | Rumble | ❌ Not working | Same issue |
-| Motion/Gyro | ❌ Not implemented | Data not decoded |
+| Motion/Gyro | ⚠️ Plumbing ready | DSU motion fields are sent (as zeros) — the gyro bytes in the BLE report are not decoded yet |
 | Native HID | ❌ Not possible | Would require DriverKit (kernel-level) |
 
 ## 🤝 Contributing
