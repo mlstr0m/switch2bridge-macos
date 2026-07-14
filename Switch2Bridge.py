@@ -16,6 +16,8 @@ import logging
 import subprocess
 import sys
 import threading
+import time
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 # ============================================================
@@ -63,16 +65,21 @@ NINTENDO_COMPANY_ID = 0x057e
 # Switch 2 Pro Controller product ID 0x2069, little-endian as it appears on the wire
 SWITCH2_PRO_PID_LE = b'\x69\x20'
 
+SCAN_TIMEOUT = 5.0
+CONNECT_TIMEOUT = 15.0
+# After an unexpected drop, keep trying to reconnect for this long
+RECONNECT_WINDOW = 60.0
+
 CONFIG_DIR = Path.home() / "Library" / "Application Support" / "Switch2Bridge"
 MAPPINGS_FILE = CONFIG_DIR / "mappings.json"
 
 LOG_DIR = Path.home() / "Library" / "Logs" / "Switch2Bridge"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
-logging.basicConfig(
-    filename=str(LOG_DIR / "bridge.log"),
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+_log_handler = RotatingFileHandler(
+    LOG_DIR / "bridge.log", maxBytes=1_000_000, backupCount=2
 )
+_log_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+logging.basicConfig(level=logging.INFO, handlers=[_log_handler])
 log = logging.getLogger(__name__)
 
 
@@ -85,6 +92,7 @@ class Mappings:
 
     Loaded from ~/Library/Application Support/Switch2Bridge/mappings.json.
     On first launch, the default mapping is written there so users can edit it.
+    A value of null (or "<none>") leaves that button unmapped.
     """
 
     DEFAULT = {
@@ -93,6 +101,7 @@ class Mappings:
             "A": "z", "B": "x", "X": "c", "Y": "v",
             "L": "q", "R": "e", "ZL": "1", "ZR": "3",
             "+": "p", "-": "m", "HOME": "h", "CAPT": "o",
+            "C": None,
             "LS": "f", "RS": "g", "GL": "9", "GR": "0",
             "DUP": "<up>", "DDOWN": "<down>",
             "DLEFT": "<left>", "DRIGHT": "<right>",
@@ -104,22 +113,32 @@ class Mappings:
         },
     }
 
+    BUTTON_NAMES = frozenset(DEFAULT["buttons"])
+    STICK_DIRECTIONS = frozenset(("up", "down", "left", "right"))
+
     SPECIAL_KEYS = {
         "<up>": Key.up, "<down>": Key.down,
         "<left>": Key.left, "<right>": Key.right,
         "<space>": Key.space, "<enter>": Key.enter,
         "<esc>": Key.esc, "<tab>": Key.tab,
-        "<backspace>": Key.backspace,
+        "<backspace>": Key.backspace, "<delete>": Key.delete,
+        "<home>": Key.home, "<end>": Key.end,
+        "<pageup>": Key.page_up, "<pagedown>": Key.page_down,
         "<shift>": Key.shift, "<ctrl>": Key.ctrl,
         "<alt>": Key.alt, "<cmd>": Key.cmd,
     }
+    SPECIAL_KEYS.update({f"<f{i}>": getattr(Key, f"f{i}") for i in range(1, 21)})
+
+    THRESHOLD_MIN, THRESHOLD_MAX = 0.1, 0.9
 
     def __init__(self):
         self.buttons = {}
         self.stick_threshold = 0.5
         self.left_stick = {}
         self.right_stick = {}
-        self.last_error = None  # consumed by the UI tick
+        # Consumed by the UI tick: error → alert, warning → notification
+        self.last_error = None
+        self.last_warning = None
 
     # --- IO ---
 
@@ -132,9 +151,14 @@ class Mappings:
             log.info("wrote default mappings to %s", MAPPINGS_FILE)
 
     def load(self):
-        """Load mappings from disk, falling back to defaults on error."""
+        """Load mappings from disk, falling back to defaults on error.
+
+        Returns True only when the file was read and applied cleanly.
+        """
         self.last_error = None
+        self.last_warning = None
         cfg = self.DEFAULT
+        ok = True
         try:
             self.ensure_default_file()
             with open(MAPPINGS_FILE) as f:
@@ -142,37 +166,85 @@ class Mappings:
         except Exception as e:
             log.exception("failed to read mappings.json")
             self.last_error = f"Could not read mappings.json: {e}\nUsing defaults."
+            cfg = self.DEFAULT
+            ok = False
 
         try:
             self._apply(cfg)
             log.info("mappings loaded from %s", MAPPINGS_FILE)
-            return True
         except Exception as e:
             log.exception("invalid mappings.json")
             self.last_error = f"Invalid mappings.json: {e}\nUsing defaults."
             self._apply(self.DEFAULT)
-            return False
+            ok = False
+        return ok
 
     # --- internals ---
 
     def _apply(self, cfg):
         buttons = cfg.get("buttons", {})
         sticks = cfg.get("sticks", {})
+        if not isinstance(buttons, dict):
+            raise ValueError('"buttons" must be an object')
+        if not isinstance(sticks, dict):
+            raise ValueError('"sticks" must be an object')
 
-        self.buttons = {name: self._parse_key(v) for name, v in buttons.items()}
-        self.stick_threshold = float(sticks.get("threshold", 0.5))
-        self.left_stick = {d: self._parse_key(k) for d, k in sticks.get("left", {}).items()}
-        self.right_stick = {d: self._parse_key(k) for d, k in sticks.get("right", {}).items()}
+        warnings = []
+
+        unknown = sorted(set(buttons) - self.BUTTON_NAMES)
+        if unknown:
+            warnings.append(f"Unknown button name(s) ignored: {', '.join(unknown)}")
+
+        self.buttons = {
+            name: self._parse_key(v)
+            for name, v in buttons.items() if name in self.BUTTON_NAMES
+        }
+
+        try:
+            threshold = float(sticks.get("threshold", 0.5))
+        except (TypeError, ValueError):
+            raise ValueError('"sticks.threshold" must be a number')
+        clamped = min(max(threshold, self.THRESHOLD_MIN), self.THRESHOLD_MAX)
+        if clamped != threshold:
+            warnings.append(f"Stick threshold {threshold} out of range, using {clamped}")
+        self.stick_threshold = clamped
+
+        parsed_sticks = {}
+        for side in ("left", "right"):
+            side_cfg = sticks.get(side, {})
+            if not isinstance(side_cfg, dict):
+                raise ValueError(f'"sticks.{side}" must be an object')
+            unknown = sorted(set(side_cfg) - self.STICK_DIRECTIONS)
+            if unknown:
+                warnings.append(
+                    f"Unknown {side} stick direction(s) ignored: {', '.join(unknown)}"
+                )
+            parsed_sticks[side] = {
+                d: self._parse_key(k)
+                for d, k in side_cfg.items() if d in self.STICK_DIRECTIONS
+            }
+        self.left_stick = parsed_sticks["left"]
+        self.right_stick = parsed_sticks["right"]
+
+        if warnings:
+            self.last_warning = "\n".join(warnings)
 
     @classmethod
     def _parse_key(cls, value):
+        if value is None or value == "<none>":
+            return None
         if not isinstance(value, str):
-            raise ValueError(f"key must be a string, got {type(value).__name__}")
+            raise ValueError(f"key must be a string or null, got {type(value).__name__}")
         if value in cls.SPECIAL_KEYS:
             return cls.SPECIAL_KEYS[value]
         if len(value) == 1:
-            return value
-        raise ValueError(f"unknown key {value!r} (use a single character or one of {sorted(cls.SPECIAL_KEYS)})")
+            # "Z" would be typed as shift+z by pynput; games expect the bare keycode
+            if value != value.lower():
+                log.info("normalizing key %r to %r", value, value.lower())
+            return value.lower()
+        raise ValueError(
+            f"unknown key {value!r} (use a single character, null, or one of {sorted(cls.SPECIAL_KEYS)})"
+        )
 
 
 # ============================================================
@@ -186,42 +258,82 @@ class ControllerBridge:
         self.mappings = mappings
         self.is_connected = False
         self.is_searching = False
+        self.is_connecting = False
+        self.is_reconnecting = False
         self.controller_name = None
         self.packet_count = 0
         # Set by worker, read & cleared by the main-thread UI tick
         self.last_error = None
-        self.pressed_keys = set()
+        self.last_notice = None
+        # Key state: which key each input source holds, and how many sources
+        # hold each key (two buttons mapped to the same key must not release
+        # it while one of them is still down).
+        self._key_lock = threading.Lock()
+        self._source_keys = {}   # source name -> key currently held
+        self._key_refs = {}      # key -> number of sources holding it
         self._client = None
         self._stop_event = threading.Event()
         self._thread = None
+        self._loop = None
+        self._task = None
 
     # --- key dispatch ---
 
-    def _set_key(self, key, active):
-        if key is None:
-            return
-        if active:
-            if key not in self.pressed_keys:
-                self.pressed_keys.add(key)
-                try:
-                    keyboard.press(key)
-                except Exception as e:
-                    log.warning("keyboard.press failed: %s", e)
-        else:
-            if key in self.pressed_keys:
-                self.pressed_keys.discard(key)
-                try:
-                    keyboard.release(key)
-                except Exception as e:
-                    log.warning("keyboard.release failed: %s", e)
+    def _press_ref(self, key):
+        n = self._key_refs.get(key, 0)
+        self._key_refs[key] = n + 1
+        if n == 0:
+            try:
+                keyboard.press(key)
+            except Exception as e:
+                log.warning("keyboard.press failed: %s", e)
 
-    def release_all_keys(self):
-        for key in list(self.pressed_keys):
+    def _release_ref(self, key):
+        n = self._key_refs.get(key, 0)
+        if n <= 1:
+            self._key_refs.pop(key, None)
             try:
                 keyboard.release(key)
             except Exception as e:
-                log.warning("keyboard.release on cleanup failed: %s", e)
-        self.pressed_keys.clear()
+                log.warning("keyboard.release failed: %s", e)
+        else:
+            self._key_refs[key] = n - 1
+
+    def _set_key(self, source, key, active):
+        """Press/release `key` on behalf of `source` (a button or stick direction)."""
+        with self._key_lock:
+            prev = self._source_keys.get(source)
+            if active and key is not None:
+                if prev == key:
+                    return
+                if prev is not None:
+                    self._release_ref(prev)
+                self._source_keys[source] = key
+                self._press_ref(key)
+            else:
+                if prev is None:
+                    return
+                del self._source_keys[source]
+                self._release_ref(prev)
+
+    def release_all_keys(self):
+        with self._key_lock:
+            for key in list(self._key_refs):
+                try:
+                    keyboard.release(key)
+                except Exception as e:
+                    log.warning("keyboard.release on cleanup failed: %s", e)
+            self._key_refs.clear()
+            self._source_keys.clear()
+
+    def _set_stick_key(self, source, key, value):
+        """Threshold with hysteresis: press above t, release below 0.8*t.
+
+        Avoids key chatter when the stick hovers right at the threshold.
+        """
+        t = self.mappings.stick_threshold
+        held = source in self._source_keys
+        self._set_key(source, key, value > (t * 0.8 if held else t))
 
     # --- BLE input parser ---
 
@@ -235,30 +347,31 @@ class ControllerBridge:
         b2, b3, b4 = data[2], data[3], data[4]
 
         # face buttons (byte 2)
-        self._set_key(b.get('B'), b2 & 0x01)
-        self._set_key(b.get('A'), b2 & 0x02)
-        self._set_key(b.get('Y'), b2 & 0x04)
-        self._set_key(b.get('X'), b2 & 0x08)
-        self._set_key(b.get('R'), b2 & 0x10)
-        self._set_key(b.get('ZR'), b2 & 0x20)
-        self._set_key(b.get('+'), b2 & 0x40)
-        self._set_key(b.get('RS'), b2 & 0x80)
+        self._set_key('B', b.get('B'), b2 & 0x01)
+        self._set_key('A', b.get('A'), b2 & 0x02)
+        self._set_key('Y', b.get('Y'), b2 & 0x04)
+        self._set_key('X', b.get('X'), b2 & 0x08)
+        self._set_key('R', b.get('R'), b2 & 0x10)
+        self._set_key('ZR', b.get('ZR'), b2 & 0x20)
+        self._set_key('+', b.get('+'), b2 & 0x40)
+        self._set_key('RS', b.get('RS'), b2 & 0x80)
 
         # d-pad + left shoulder/trigger (byte 3)
-        self._set_key(b.get('DDOWN'), b3 & 0x01)
-        self._set_key(b.get('DRIGHT'), b3 & 0x02)
-        self._set_key(b.get('DLEFT'), b3 & 0x04)
-        self._set_key(b.get('DUP'), b3 & 0x08)
-        self._set_key(b.get('L'), b3 & 0x10)
-        self._set_key(b.get('ZL'), b3 & 0x20)
-        self._set_key(b.get('-'), b3 & 0x40)
-        self._set_key(b.get('LS'), b3 & 0x80)
+        self._set_key('DDOWN', b.get('DDOWN'), b3 & 0x01)
+        self._set_key('DRIGHT', b.get('DRIGHT'), b3 & 0x02)
+        self._set_key('DLEFT', b.get('DLEFT'), b3 & 0x04)
+        self._set_key('DUP', b.get('DUP'), b3 & 0x08)
+        self._set_key('L', b.get('L'), b3 & 0x10)
+        self._set_key('ZL', b.get('ZL'), b3 & 0x20)
+        self._set_key('-', b.get('-'), b3 & 0x40)
+        self._set_key('LS', b.get('LS'), b3 & 0x80)
 
-        # special (byte 4)
-        self._set_key(b.get('HOME'), b4 & 0x01)
-        self._set_key(b.get('GR'), b4 & 0x04)
-        self._set_key(b.get('GL'), b4 & 0x08)
-        self._set_key(b.get('CAPT'), b4 & 0x10)
+        # special (byte 4) — 0x02 is believed to be the new C button
+        self._set_key('HOME', b.get('HOME'), b4 & 0x01)
+        self._set_key('C', b.get('C'), b4 & 0x02)
+        self._set_key('GR', b.get('GR'), b4 & 0x04)
+        self._set_key('GL', b.get('GL'), b4 & 0x08)
+        self._set_key('CAPT', b.get('CAPT'), b4 & 0x10)
 
         # sticks: 12-bit packed across bytes 5-10
         lx_raw = data[5] | ((data[6] & 0x0F) << 8)
@@ -271,23 +384,22 @@ class ControllerBridge:
         rx = (rx_raw - 2048) / 2048.0
         ry = (ry_raw - 2048) / 2048.0
 
-        t = self.mappings.stick_threshold
         ls = self.mappings.left_stick
         rs = self.mappings.right_stick
 
-        self._set_key(ls.get('up'),    ly > t)
-        self._set_key(ls.get('down'),  ly < -t)
-        self._set_key(ls.get('left'),  lx < -t)
-        self._set_key(ls.get('right'), lx > t)
+        self._set_stick_key('ls_up',    ls.get('up'),    ly)
+        self._set_stick_key('ls_down',  ls.get('down'),  -ly)
+        self._set_stick_key('ls_left',  ls.get('left'),  -lx)
+        self._set_stick_key('ls_right', ls.get('right'), lx)
 
-        self._set_key(rs.get('up'),    ry > t)
-        self._set_key(rs.get('down'),  ry < -t)
-        self._set_key(rs.get('left'),  rx < -t)
-        self._set_key(rs.get('right'), rx > t)
+        self._set_stick_key('rs_up',    rs.get('up'),    ry)
+        self._set_stick_key('rs_down',  rs.get('down'),  -ry)
+        self._set_stick_key('rs_left',  rs.get('left'),  -rx)
+        self._set_stick_key('rs_right', rs.get('right'), rx)
 
     # --- discovery ---
 
-    async def _find_controller(self, timeout=5.0):
+    async def _find_controller(self, timeout=SCAN_TIMEOUT):
         """Returns (address, name) or (None, None)."""
         devices = await BleakScanner.discover(timeout=timeout, return_adv=True)
         for address, (device, adv) in devices.items():
@@ -302,79 +414,167 @@ class ControllerBridge:
 
     # --- main async routine ---
 
-    async def _connect_async(self):
-        self.is_searching = True
-        self.packet_count = 0
+    async def _session(self, address, name, reconnected=False):
+        """Connect and stream input until disconnect/stop.
 
+        Returns True once input streaming was reached (used to decide whether
+        an auto-reconnect is worth attempting). On failure, last_error is set.
+        """
+        client = BleakClient(address, timeout=CONNECT_TIMEOUT)
+        self._client = client
+        self.is_connecting = True
         try:
-            address, name = await self._find_controller()
-        except Exception as e:
-            log.exception("BLE scan failed")
-            self.last_error = f"Bluetooth scan failed: {e}"
-            self.is_searching = False
-            return
-
-        self.is_searching = False
-
-        if self._stop_event.is_set():
-            return
-
-        if not address:
-            self.last_error = "Controller not found. Make sure it's on and in pairing mode."
-            return
-
-        try:
-            self._client = BleakClient(address, timeout=15.0)
-            await self._client.connect()
-
-            if not self._client.is_connected:
+            try:
+                await client.connect()
+            except Exception as e:
+                log.exception("connect failed")
+                self.last_error = f"Connection error: {e}"
+                return False
+            if not client.is_connected:
                 self.last_error = "Failed to connect to controller."
-                return
-
-            self.controller_name = name
-            self.is_connected = True
-            log.info("connected to %s @ %s", name, address)
-
-            await self._client.start_notify(INPUT_CHAR_UUID, self._on_data)
-
-            while not self._stop_event.is_set() and self._client.is_connected:
-                await asyncio.sleep(0.1)
+                return False
 
             try:
-                if self._client.is_connected:
-                    await self._client.stop_notify(INPUT_CHAR_UUID)
-                    await self._client.disconnect()
+                await client.start_notify(INPUT_CHAR_UUID, self._on_data)
             except Exception as e:
-                log.warning("BLE cleanup error: %s", e)
+                log.exception("start_notify failed")
+                self.last_error = f"Connection error: {e}"
+                return False
 
-        except Exception as e:
-            log.exception("connection error")
-            self.last_error = f"Connection error: {e}"
+            self.controller_name = name
+            self.is_connecting = False
+            self.is_connected = True
+            self.is_reconnecting = False
+            log.info("connected to %s @ %s", name, address)
+            if reconnected:
+                self.last_notice = f"Reconnected to {name}"
+
+            while not self._stop_event.is_set() and client.is_connected:
+                await asyncio.sleep(0.1)
+            return True
         finally:
-            self.release_all_keys()
+            self.is_connecting = False
             self.is_connected = False
             self.controller_name = None
+            self._client = None
+            self.release_all_keys()
+            try:
+                if client.is_connected:
+                    await client.stop_notify(INPUT_CHAR_UUID)
+            except Exception as e:
+                log.warning("BLE stop_notify error: %s", e)
+            try:
+                # Always disconnect: also cancels a pending CoreBluetooth
+                # connection attempt if we were cancelled mid-connect.
+                await client.disconnect()
+            except Exception as e:
+                log.warning("BLE disconnect error: %s", e)
+
+    async def _connect_async(self):
+        was_connected = False
+        deadline = None
+        try:
+            while not self._stop_event.is_set():
+                self.is_searching = True
+                self.packet_count = 0
+                try:
+                    address, name = await self._find_controller()
+                except Exception as e:
+                    log.exception("BLE scan failed")
+                    self.last_error = f"Bluetooth scan failed: {e}"
+                    return
+                finally:
+                    self.is_searching = False
+
+                if self._stop_event.is_set():
+                    return
+
+                streamed = False
+                if address:
+                    streamed = await self._session(
+                        address, name, reconnected=was_connected
+                    )
+
+                if self._stop_event.is_set():
+                    return
+
+                if streamed:
+                    # Unexpected drop (controller slept, went out of range…):
+                    # retry for RECONNECT_WINDOW before giving up.
+                    was_connected = True
+                    deadline = time.monotonic() + RECONNECT_WINDOW
+                    self.is_reconnecting = True
+                    self.last_notice = "Controller disconnected — reconnecting…"
+                    log.info("connection dropped, entering reconnect loop")
+                    continue
+
+                if not was_connected:
+                    # First attempt failed outright — surface and stop.
+                    if not address:
+                        self.last_error = (
+                            "Controller not found. Make sure it's on and in pairing mode."
+                        )
+                    return
+
+                if deadline is not None and time.monotonic() > deadline:
+                    self.last_error = "Could not reconnect to the controller."
+                    return
+
+                await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            log.info("bridge task cancelled")
+        finally:
+            self.is_reconnecting = False
 
     # --- public API ---
+
+    @property
+    def is_stopping(self):
+        return (
+            self._stop_event.is_set()
+            and self._thread is not None
+            and self._thread.is_alive()
+        )
 
     def connect(self):
         if self._thread and self._thread.is_alive():
             return
         self._stop_event.clear()
+        self.last_error = None
+        self.last_notice = None
 
         def run():
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
+            self._loop = loop
             try:
-                loop.run_until_complete(self._connect_async())
+                self._task = loop.create_task(self._connect_async())
+                try:
+                    loop.run_until_complete(self._task)
+                except asyncio.CancelledError:
+                    pass
             finally:
+                self._task = None
+                self._loop = None
+                try:
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                except Exception:
+                    pass
                 loop.close()
 
         self._thread = threading.Thread(target=run, daemon=True)
         self._thread.start()
 
     def disconnect(self, wait=False, timeout=2.0):
-        self._stop_event.set()
+        if not self._stop_event.is_set():
+            self._stop_event.set()
+            # Interrupt whatever the worker is awaiting (scan, connect, stream)
+            loop, task = self._loop, self._task
+            if loop is not None and task is not None:
+                try:
+                    loop.call_soon_threadsafe(task.cancel)
+                except RuntimeError:
+                    pass  # loop already closed
         if wait and self._thread and self._thread.is_alive():
             self._thread.join(timeout)
 
@@ -406,6 +606,7 @@ class Switch2BridgeApp(rumps.App):
         self._mapping_item = rumps.MenuItem("Button Mapping…", callback=self._show_mapping)
         self._reveal_item = rumps.MenuItem("Edit mappings file…", callback=self._reveal_mappings)
         self._reload_item = rumps.MenuItem("Reload mappings", callback=self._reload_mappings)
+        self._logs_item = rumps.MenuItem("Open logs…", callback=self._open_logs)
         self._quit_item = rumps.MenuItem("Quit", callback=self._on_quit)
 
         self.menu = [
@@ -417,6 +618,7 @@ class Switch2BridgeApp(rumps.App):
             self._mapping_item,
             self._reveal_item,
             self._reload_item,
+            self._logs_item,
             None,
             self._quit_item,
         ]
@@ -431,10 +633,16 @@ class Switch2BridgeApp(rumps.App):
     # --- state machine ---
 
     def _current_state(self):
-        if self.bridge.is_searching:
-            return 'searching'
+        if self.bridge.is_stopping:
+            return 'stopping'
         if self.bridge.is_connected:
             return 'connected'
+        if self.bridge.is_reconnecting:
+            return 'reconnecting'
+        if self.bridge.is_connecting:
+            return 'connecting'
+        if self.bridge.is_searching:
+            return 'searching'
         return 'idle'
 
     def _apply_state(self, state):
@@ -443,16 +651,37 @@ class Switch2BridgeApp(rumps.App):
             self._status_item.title = "Searching…"
             self._detail_item.title = " "
             self._action_item.title = "Cancel"
+            self._action_item.set_callback(self._on_action)
+        elif state == 'connecting':
+            self.title = "🔗"
+            self._status_item.title = "Connecting…"
+            self._detail_item.title = " "
+            self._action_item.title = "Cancel"
+            self._action_item.set_callback(self._on_action)
+        elif state == 'reconnecting':
+            self.title = "🔍"
+            self._status_item.title = "Reconnecting…"
+            self._detail_item.title = " "
+            self._action_item.title = "Cancel"
+            self._action_item.set_callback(self._on_action)
         elif state == 'connected':
             self.title = "🟢"
             self._status_item.title = f"✓ {self.bridge.controller_name or 'Controller'}"
             self._detail_item.title = f"   {self.bridge.packet_count} packets"
             self._action_item.title = "Disconnect"
+            self._action_item.set_callback(self._on_action)
+        elif state == 'stopping':
+            self.title = "🎮"
+            self._status_item.title = "Stopping…"
+            self._detail_item.title = " "
+            self._action_item.title = "Stopping…"
+            self._action_item.set_callback(None)  # disabled
         else:  # idle
             self.title = "🎮"
             self._status_item.title = "○ Not connected"
             self._detail_item.title = " "
             self._action_item.title = "Connect Controller"
+            self._action_item.set_callback(self._on_action)
         self._last_state = state
 
     def _tick(self, _):
@@ -460,13 +689,19 @@ class Switch2BridgeApp(rumps.App):
         if not self._accessibility_checked:
             self._accessibility_checked = True
             self._check_accessibility()
-            self._surface_mappings_error()
+            self._surface_mappings_messages()
 
         if self.bridge.last_error:
             err = self.bridge.last_error
             self.bridge.last_error = None
             log.warning("user-visible bridge error: %s", err)
             self._notify("Connection failed", err)
+
+        if self.bridge.last_notice:
+            notice = self.bridge.last_notice
+            self.bridge.last_notice = None
+            log.info("user-visible bridge notice: %s", notice)
+            self._notify("Controller", notice)
 
         state = self._current_state()
         if state != self._last_state:
@@ -481,7 +716,7 @@ class Switch2BridgeApp(rumps.App):
         state = self._current_state()
         if state == 'idle':
             self.bridge.connect()
-        else:
+        elif state != 'stopping':
             self.bridge.disconnect()
         self._tick(None)
 
@@ -504,6 +739,7 @@ class Switch2BridgeApp(rumps.App):
             f"  L→{fmt(b.get('L'))}  R→{fmt(b.get('R'))}  ZL→{fmt(b.get('ZL'))}  ZR→{fmt(b.get('ZR'))}",
             f"  +→{fmt(b.get('+'))}  -→{fmt(b.get('-'))}  Home→{fmt(b.get('HOME'))}  Capture→{fmt(b.get('CAPT'))}",
             f"  GL→{fmt(b.get('GL'))}  GR→{fmt(b.get('GR'))}  LS→{fmt(b.get('LS'))}  RS→{fmt(b.get('RS'))}",
+            f"  C→{fmt(b.get('C'))}",
             "",
             f"  Left stick: {fmt(ls.get('up'))}/{fmt(ls.get('left'))}/{fmt(ls.get('down'))}/{fmt(ls.get('right'))} (U/L/D/R)",
             f"  Right stick: {fmt(rs.get('up'))}/{fmt(rs.get('left'))}/{fmt(rs.get('down'))}/{fmt(rs.get('right'))} (U/L/D/R)",
@@ -526,13 +762,22 @@ class Switch2BridgeApp(rumps.App):
         # Release everything currently held to avoid stuck keys with the new map
         self.bridge.release_all_keys()
         ok = self.mappings.load()
-        self._surface_mappings_error()
+        self._surface_mappings_messages()
         if ok:
             self._notify("Mappings reloaded", f"Loaded from {MAPPINGS_FILE.name}")
+
+    def _open_logs(self, _):
+        try:
+            subprocess.Popen(["open", str(LOG_DIR)])
+        except Exception as e:
+            log.exception("could not open logs folder")
+            rumps.alert(title=APP_NAME, message=f"Could not open logs: {e}", ok="OK")
 
     def _on_quit(self, _):
         log.info("quitting")
         self.bridge.disconnect(wait=True, timeout=2.0)
+        # Belt & suspenders: never leave a key logically held after exit
+        self.bridge.release_all_keys()
         rumps.quit_application()
 
     # --- startup checks ---
@@ -542,7 +787,7 @@ class Switch2BridgeApp(rumps.App):
             return
         if not AXIsProcessTrusted():
             log.warning("Accessibility permission not granted")
-            rumps.alert(
+            clicked_ok = rumps.alert(
                 title="Accessibility Required",
                 message=(
                     f"{APP_NAME} needs Accessibility access to simulate keyboard "
@@ -551,15 +796,27 @@ class Switch2BridgeApp(rumps.App):
                     "System Settings → Privacy & Security → Accessibility\n\n"
                     "You may need to quit and relaunch after granting access."
                 ),
-                ok="OK",
+                ok="Open System Settings",
+                cancel="Later",
             )
+            if clicked_ok == 1:
+                subprocess.Popen([
+                    "open",
+                    "x-apple.systempreferences:com.apple.preference.security"
+                    "?Privacy_Accessibility",
+                ])
 
-    def _surface_mappings_error(self):
+    def _surface_mappings_messages(self):
         if self.mappings.last_error:
             err = self.mappings.last_error
             self.mappings.last_error = None
             log.warning("user-visible mappings error: %s", err)
             rumps.alert(title="Mappings", message=err, ok="OK")
+        if self.mappings.last_warning:
+            warn = self.mappings.last_warning
+            self.mappings.last_warning = None
+            log.warning("user-visible mappings warning: %s", warn)
+            self._notify("Mappings", warn)
 
     # --- helpers ---
 

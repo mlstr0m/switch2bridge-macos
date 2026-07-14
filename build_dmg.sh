@@ -7,7 +7,7 @@ set -e
 
 APP_NAME="Switch2 Bridge"
 DMG_NAME="Switch2Bridge-Installer"
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 echo ""
 echo "╔═══════════════════════════════════════════════════════════╗"
@@ -50,15 +50,15 @@ echo "🔨 Building application..."
 
 rm -rf build dist
 
-python setup_app.py py2app 2>&1 | while read line; do
-    if [[ "$line" == *"error"* ]] || [[ "$line" == *"Error"* ]]; then
-        echo "   $line"
-    fi
-done
+BUILD_LOG="build_py2app.log"
+if ! python setup_app.py py2app > "$BUILD_LOG" 2>&1; then
+    echo "❌ Build failed — last lines of ${BUILD_LOG}:"
+    tail -n 25 "$BUILD_LOG"
+    exit 1
+fi
 
 if [ ! -d "dist/${APP_NAME}.app" ]; then
-    echo "❌ Build failed"
-    echo "   Try: python setup_app.py py2app"
+    echo "❌ Build failed (no .app produced) — see ${BUILD_LOG}"
     exit 1
 fi
 

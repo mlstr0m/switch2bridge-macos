@@ -17,8 +17,8 @@ OPTIONS = {
         'CFBundleName': 'Switch2 Bridge',
         'CFBundleDisplayName': 'Switch2 Bridge',
         'CFBundleIdentifier': 'com.aureliendesert.switch2bridge',
-        'CFBundleVersion': '1.0.0',
-        'CFBundleShortVersionString': '1.0.0',
+        'CFBundleVersion': '1.1.0',
+        'CFBundleShortVersionString': '1.1.0',
         'CFBundleIconFile': 'AppIcon',
         'LSMinimumSystemVersion': '13.0',
         'LSUIElement': True,  # Menubar only, no dock icon
