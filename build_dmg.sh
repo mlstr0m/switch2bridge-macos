@@ -133,5 +133,7 @@ echo "   To test: open dist/${DMG_NAME}.dmg"
 echo "═══════════════════════════════════════════════════════════"
 echo ""
 
-# Open in Finder
-open dist
+# Open in Finder (skip on CI / headless)
+if [ -z "${CI:-}" ]; then
+    open dist
+fi

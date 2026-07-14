@@ -4,6 +4,7 @@
 
 A Python menubar app that connects to the Switch 2 Pro Controller via BLE and translates inputs to keyboard presses for use with emulators like Ryujinx.
 
+[![CI](https://github.com/mlstr0m/switch2bridge-macos/actions/workflows/ci.yml/badge.svg)](https://github.com/mlstr0m/switch2bridge-macos/actions/workflows/ci.yml)
 [![macOS](https://img.shields.io/badge/macOS-Ventura%2B-blue?logo=apple)](https://www.apple.com/macos)
 [![Python](https://img.shields.io/badge/Python-3.9%2B-green?logo=python)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
