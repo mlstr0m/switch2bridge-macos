@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Headless tests
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Bridge tests (mappings, key dispatch, BLE lifecycle)
+        run: python tests/test_bridge.py
+
+      - name: DSU server tests (cemuhook protocol over UDP)
+        run: python tests/test_dsu.py
+
+  build:
+    name: Build .app + DMG
+    runs-on: macos-14
+    needs: test
+    # Building is slower — only on main and manual runs
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Build DMG
+        run: ./build_dmg.sh
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Switch2Bridge-Installer
+          path: dist/Switch2Bridge-Installer.dmg
+          if-no-files-found: error
