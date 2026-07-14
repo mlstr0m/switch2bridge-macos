@@ -2,6 +2,7 @@
 dist/
 build/
 *.spec
+build_py2app.log
 
 # On ignore tous les fichiers de cache Python
 **/__pycache__/
@@ -16,6 +17,7 @@ build/
 __pycache__/
 *.py[cod]
 *$py.class
+venv/
 .venv/
 env/
 

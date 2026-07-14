@@ -26,6 +26,8 @@ A Python menubar app that connects to the Switch 2 Pro Controller via BLE and tr
 - ✅ **Grip buttons** — Switch 2 exclusive GL/GR buttons supported
 - ✅ **Ryujinx compatible** — keyboard bridge for emulator support
 - ✅ **No pairing required** — bypasses macOS Bluetooth limitations
+- ✅ **Auto-reconnect** — if the controller sleeps or drops, the bridge retries for 60 s
+- ✅ **C button** — the Switch 2's new C button can be mapped (experimental)
 
 ## 🤔 Why This Exists
 
@@ -120,9 +122,11 @@ The first time you launch the app it writes a JSON config to:
 
 Edit it to remap any button or stick direction, then **Reload mappings** from the menubar (or restart the app). The menubar also has **Edit mappings file…** which reveals the file in Finder.
 
-Each value is either a single character (`"a"`, `"5"`, `"."`) or a named key in angle brackets: `<up>`, `<down>`, `<left>`, `<right>`, `<space>`, `<enter>`, `<esc>`, `<tab>`, `<backspace>`, `<shift>`, `<ctrl>`, `<alt>`, `<cmd>`.
+Each value is either a single character (`"a"`, `"5"`, `"."`), `null` to leave a button unmapped, or a named key in angle brackets: `<up>`, `<down>`, `<left>`, `<right>`, `<space>`, `<enter>`, `<esc>`, `<tab>`, `<backspace>`, `<delete>`, `<home>`, `<end>`, `<pageup>`, `<pagedown>`, `<shift>`, `<ctrl>`, `<alt>`, `<cmd>`, and `<f1>` … `<f20>`.
 
-Invalid JSON falls back to defaults and the menubar surfaces the parse error.
+The Switch 2's new **C button** is supported as `"C"` (unmapped by default — set it to any key to use it).
+
+Invalid JSON falls back to defaults and the menubar surfaces the parse error. Unknown button names or stick directions (typos) are reported via a notification instead of being silently ignored. Two inputs may share the same key: the key is only released once both are released.
 
 ## 📁 Project Structure
 
@@ -132,6 +136,8 @@ switch2bridge-macos/
 ├── setup_app.py        # py2app configuration
 ├── build_dmg.sh        # Automated build script (.app + DMG)
 ├── requirements.txt    # Python dependencies
+├── tests/
+│   └── test_bridge.py  # Headless tests (mappings, key dispatch, BLE lifecycle)
 ├── AppIcon.icns        # Application icon (used by py2app)
 ├── LICENSE
 └── README.md
@@ -171,7 +177,8 @@ switch2bridge-macos/
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Buttons | ✅ Working | All buttons mapped |
-| Analog Sticks | ⚠️ Digital | Read at 12-bit, then thresholded to 8 directions (WASD/IJKL). True analog would require a virtual HID device (DriverKit). |
+| C button | 🧪 Experimental | Parsed as byte 4, bit `0x02` — please report if it doesn't fire |
+| Analog Sticks | ⚠️ Digital | Read at 12-bit, then thresholded (with hysteresis to avoid chatter) to 8 directions (WASD/IJKL). True analog would require a virtual HID device (DriverKit). |
 | LED Control | ❌ Not working | Output characteristic doesn't respond |
 | Rumble | ❌ Not working | Same issue |
 | Motion/Gyro | ❌ Not implemented | Data not decoded |
