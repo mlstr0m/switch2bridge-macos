@@ -52,6 +52,8 @@ except ImportError:
     except ImportError:
         pass
 
+from dsu_server import DSUServer
+
 
 # ============================================================
 # CONSTANTS
@@ -111,6 +113,11 @@ class Mappings:
             "left":  {"up": "w", "down": "s", "left": "a", "right": "d"},
             "right": {"up": "i", "down": "k", "left": "j", "right": "l"},
         },
+        "dsu": {
+            "enabled": True,
+            "host": "127.0.0.1",
+            "port": 26760,
+        },
     }
 
     BUTTON_NAMES = frozenset(DEFAULT["buttons"])
@@ -136,6 +143,9 @@ class Mappings:
         self.stick_threshold = 0.5
         self.left_stick = {}
         self.right_stick = {}
+        self.dsu_enabled = True
+        self.dsu_host = "127.0.0.1"
+        self.dsu_port = 26760
         # Consumed by the UI tick: error → alert, warning → notification
         self.last_error = None
         self.last_warning = None
@@ -226,8 +236,42 @@ class Mappings:
         self.left_stick = parsed_sticks["left"]
         self.right_stick = parsed_sticks["right"]
 
+        dsu = cfg.get("dsu", {})
+        if not isinstance(dsu, dict):
+            raise ValueError('"dsu" must be an object')
+        self.dsu_enabled = bool(dsu.get("enabled", True))
+        self.dsu_host = str(dsu.get("host", "127.0.0.1"))
+        try:
+            port = int(dsu.get("port", 26760))
+        except (TypeError, ValueError):
+            raise ValueError('"dsu.port" must be an integer')
+        if not (1024 <= port <= 65535):
+            warnings.append(f"DSU port {port} out of range, using 26760")
+            port = 26760
+        self.dsu_port = port
+
         if warnings:
             self.last_warning = "\n".join(warnings)
+
+    def set_dsu_enabled(self, enabled):
+        """Persist the DSU toggle back into mappings.json (best effort)."""
+        self.dsu_enabled = bool(enabled)
+        try:
+            self.ensure_default_file()
+            with open(MAPPINGS_FILE) as f:
+                cfg = json.load(f)
+        except Exception:
+            log.exception("could not read mappings.json to persist DSU toggle")
+            cfg = json.loads(json.dumps(self.DEFAULT))
+        dsu = cfg.get("dsu")
+        if not isinstance(dsu, dict):
+            dsu = cfg["dsu"] = {}
+        dsu["enabled"] = self.dsu_enabled
+        try:
+            with open(MAPPINGS_FILE, "w") as f:
+                json.dump(cfg, f, indent=2)
+        except Exception:
+            log.exception("could not write mappings.json to persist DSU toggle")
 
     @classmethod
     def _parse_key(cls, value):
@@ -254,8 +298,9 @@ class Mappings:
 class ControllerBridge:
     """BLE connection + keyboard input simulation."""
 
-    def __init__(self, mappings: Mappings):
+    def __init__(self, mappings: Mappings, dsu: DSUServer = None):
         self.mappings = mappings
+        self.dsu = dsu
         self.is_connected = False
         self.is_searching = False
         self.is_connecting = False
@@ -397,6 +442,20 @@ class ControllerBridge:
         self._set_stick_key('rs_left',  rs.get('left'),  -rx)
         self._set_stick_key('rs_right', rs.get('right'), rx)
 
+        # forward everything to the DSU server (true analog for emulators)
+        if self.dsu is not None and self.dsu.running:
+            self.dsu.push(
+                {
+                    'B': b2 & 0x01, 'A': b2 & 0x02, 'Y': b2 & 0x04, 'X': b2 & 0x08,
+                    'R': b2 & 0x10, 'ZR': b2 & 0x20, '+': b2 & 0x40, 'RS': b2 & 0x80,
+                    'DDOWN': b3 & 0x01, 'DRIGHT': b3 & 0x02, 'DLEFT': b3 & 0x04,
+                    'DUP': b3 & 0x08, 'L': b3 & 0x10, 'ZL': b3 & 0x20,
+                    '-': b3 & 0x40, 'LS': b3 & 0x80,
+                    'HOME': b4 & 0x01, 'CAPT': b4 & 0x10,
+                },
+                lx, ly, rx, ry,
+            )
+
     # --- discovery ---
 
     async def _find_controller(self, timeout=SCAN_TIMEOUT):
@@ -445,6 +504,8 @@ class ControllerBridge:
             self.is_connecting = False
             self.is_connected = True
             self.is_reconnecting = False
+            if self.dsu is not None:
+                self.dsu.set_connected(True)
             log.info("connected to %s @ %s", name, address)
             if reconnected:
                 self.last_notice = f"Reconnected to {name}"
@@ -457,6 +518,8 @@ class ControllerBridge:
             self.is_connected = False
             self.controller_name = None
             self._client = None
+            if self.dsu is not None:
+                self.dsu.set_connected(False)
             self.release_all_keys()
             try:
                 if client.is_connected:
@@ -597,7 +660,8 @@ class Switch2BridgeApp(rumps.App):
 
         self.mappings = Mappings()
         self.mappings.load()
-        self.bridge = ControllerBridge(self.mappings)
+        self.dsu = DSUServer(self.mappings.dsu_host, self.mappings.dsu_port)
+        self.bridge = ControllerBridge(self.mappings, self.dsu)
 
         # Long-lived menu items
         self._status_item = rumps.MenuItem("○ Not connected")
@@ -606,6 +670,7 @@ class Switch2BridgeApp(rumps.App):
         self._mapping_item = rumps.MenuItem("Button Mapping…", callback=self._show_mapping)
         self._reveal_item = rumps.MenuItem("Edit mappings file…", callback=self._reveal_mappings)
         self._reload_item = rumps.MenuItem("Reload mappings", callback=self._reload_mappings)
+        self._dsu_item = rumps.MenuItem("DSU server", callback=self._toggle_dsu)
         self._logs_item = rumps.MenuItem("Open logs…", callback=self._open_logs)
         self._quit_item = rumps.MenuItem("Quit", callback=self._on_quit)
 
@@ -618,10 +683,13 @@ class Switch2BridgeApp(rumps.App):
             self._mapping_item,
             self._reveal_item,
             self._reload_item,
+            None,
+            self._dsu_item,
             self._logs_item,
             None,
             self._quit_item,
         ]
+        self._sync_dsu()
 
         self._last_state = None
         self._accessibility_checked = False
@@ -703,12 +771,23 @@ class Switch2BridgeApp(rumps.App):
             log.info("user-visible bridge notice: %s", notice)
             self._notify("Controller", notice)
 
+        if self.dsu.last_error:
+            err = self.dsu.last_error
+            self.dsu.last_error = None
+            log.warning("user-visible DSU error: %s", err)
+            self._notify("DSU server", err)
+
         state = self._current_state()
         if state != self._last_state:
             self._apply_state(state)
         elif state == 'connected':
             # in-place title update — no menu rebuild
-            self._detail_item.title = f"   {self.bridge.packet_count} packets"
+            detail = f"   {self.bridge.packet_count} packets"
+            if self.dsu.running:
+                n = self.dsu.client_count()
+                if n:
+                    detail += f" · DSU: {n} client{'s' if n > 1 else ''}"
+            self._detail_item.title = detail
 
     # --- actions ---
 
@@ -762,9 +841,32 @@ class Switch2BridgeApp(rumps.App):
         # Release everything currently held to avoid stuck keys with the new map
         self.bridge.release_all_keys()
         ok = self.mappings.load()
+        self._sync_dsu()
         self._surface_mappings_messages()
         if ok:
             self._notify("Mappings reloaded", f"Loaded from {MAPPINGS_FILE.name}")
+
+    def _toggle_dsu(self, _):
+        self.mappings.set_dsu_enabled(not self.mappings.dsu_enabled)
+        self._sync_dsu()
+
+    def _sync_dsu(self):
+        """Reconcile the DSU server with the current settings."""
+        m = self.mappings
+        settings_changed = (self.dsu.host, self.dsu.port) != (m.dsu_host, m.dsu_port)
+        if self.dsu.running and (not m.dsu_enabled or settings_changed):
+            self.dsu.stop()
+        if settings_changed:
+            self.dsu.host, self.dsu.port = m.dsu_host, m.dsu_port
+        if m.dsu_enabled and not self.dsu.running:
+            self.dsu.start()
+        self.dsu.set_connected(self.bridge.is_connected)
+        if self.dsu.running:
+            self._dsu_item.title = f"DSU server ({self.dsu.host}:{self.dsu.port})"
+            self._dsu_item.state = 1
+        else:
+            self._dsu_item.title = "DSU server"
+            self._dsu_item.state = 0
 
     def _open_logs(self, _):
         try:
@@ -778,6 +880,7 @@ class Switch2BridgeApp(rumps.App):
         self.bridge.disconnect(wait=True, timeout=2.0)
         # Belt & suspenders: never leave a key logically held after exit
         self.bridge.release_all_keys()
+        self.dsu.stop()
         rumps.quit_application()
 
     # --- startup checks ---
