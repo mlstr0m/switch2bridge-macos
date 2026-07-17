@@ -63,11 +63,11 @@ pip install -r requirements.txt
 python Switch2Bridge.py
 ```
 
-On first launch, macOS will prompt for:
-1. **Bluetooth** — to connect to the controller
-2. **Accessibility** — to simulate keyboard input
+macOS will ask for two permissions:
+1. **Accessibility** — prompted at first launch (to simulate keyboard input)
+2. **Bluetooth** — prompted the first time you click **Connect Controller** (not at launch!)
 
-Grant both in `System Settings → Privacy & Security`.
+⚠️ **When running from source, the Bluetooth permission belongs to _Terminal_ (or your Python interpreter), not to the app.** If no prompt ever appears, add/enable Terminal manually in `System Settings → Privacy & Security → Bluetooth`, then relaunch. The app detects a denied permission and offers to open the right settings pane.
 
 ## 📦 Build a standalone .app + DMG
 
@@ -188,7 +188,9 @@ switch2bridge-macos/
 
 ## 🩺 Troubleshooting
 
-- **"Controller not found"** — make sure the Switch 2 Pro Controller is on and not paired with a console. Hold the small pair button on the back until the LEDs cycle, then click **Connect Controller** again.
+- **The controller never appears in System Settings → Bluetooth** — that's **expected**, and not a failure. This bridge is a BLE client: there is no system-level pairing, so macOS will never list the controller. The only place to watch is the app's menubar icon (🔍 → 🟢).
+- **"Controller not found"** — make sure the controller is **not paired with a console nearby** (unpair it or put the console to sleep far away). Click **Connect Controller** *first* — the search now runs for 30 s — *then* hold the small pair button on the back until the LEDs sweep back and forth.
+- **No Bluetooth prompt ever appeared (run-from-source)** — the permission belongs to Terminal/Python, not the app. Check `System Settings → Privacy & Security → Bluetooth` and enable Terminal, then relaunch. Without it, scans silently find nothing.
 - **Menubar says 🟢 connected but inputs don't reach the emulator** — macOS Accessibility permission is missing. Grant it in *System Settings → Privacy & Security → Accessibility*, then relaunch the app. (The app should also pop an alert about this on first launch.)
 - **Logs** — written to `~/Library/Logs/Switch2Bridge/bridge.log`. Open a terminal and `tail -f` it to watch what's happening in real time.
 

@@ -168,14 +168,18 @@ print("== lifecycle ==")
 class MockScanner:
     delay = 0.3
     result = {}
+    queue = []  # optional per-round results, popped first
     @staticmethod
     async def discover(timeout=None, return_adv=False):
         await asyncio.sleep(MockScanner.delay)
+        if MockScanner.queue:
+            return MockScanner.queue.pop(0)
         return MockScanner.result
 
 S2B.BleakScanner = MockScanner
 
-# not found path
+# not found path (shrink the 30 s initial window for the test)
+S2B.INITIAL_SCAN_WINDOW = 0.0
 br3 = S2B.ControllerBridge(mm)
 br3.connect()
 br3._thread.join(3)
@@ -250,6 +254,26 @@ br5.disconnect(wait=True, timeout=3.0)
 check("user disconnect stops thread", not br5._thread.is_alive())
 check("no error after user disconnect", br5.last_error is None, br5.last_error)
 check("client disconnected", not MockClient.instances[-1].is_connected)
+
+# initial search keeps scanning: nothing on round 1, found on round 2
+print("== initial scan retry ==")
+S2B.INITIAL_SCAN_WINDOW = 10.0
+MockScanner.queue = [{}]
+br6 = S2B.ControllerBridge(mm)
+br6.connect()
+time.sleep(2.0)  # scan (0.05) + 1 s pause + scan + connect
+check("found on second scan round", br6.is_connected)
+check("no error during retry", br6.last_error is None, br6.last_error)
+br6.disconnect(wait=True, timeout=3.0)
+
+# scan error -> actionable messages
+print("== scan error messages ==")
+msg = S2B.ControllerBridge._scan_error_message(Exception("CBCentralManager is not authorized"))
+check("unauthorized -> permission hint", "Privacy & Security" in msg and "Terminal" in msg, msg)
+msg = S2B.ControllerBridge._scan_error_message(Exception("Bluetooth device is turned off"))
+check("powered off -> enable hint", "turned off" in msg, msg)
+msg = S2B.ControllerBridge._scan_error_message(Exception("boom"))
+check("generic passthrough", "boom" in msg, msg)
 
 print()
 if FAILURES:
