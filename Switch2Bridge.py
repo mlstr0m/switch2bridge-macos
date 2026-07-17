@@ -66,7 +66,7 @@ except ImportError:
 # ============================================================
 
 APP_NAME = "Switch2 Bridge"
-APP_VERSION = "1.2.0"  # single source of truth — read by setup_app.py & build_dmg.sh
+APP_VERSION = "1.2.1"  # single source of truth — read by setup_app.py & build_dmg.sh
 INPUT_CHAR_UUID = "7492866c-ec3e-4619-8258-32755ffcc0f9"
 
 # Bluetooth SIG company identifier for Nintendo
@@ -76,6 +76,9 @@ SWITCH2_PRO_PID_LE = b'\x69\x20'
 
 SCAN_TIMEOUT = 5.0
 CONNECT_TIMEOUT = 15.0
+# Keep scanning this long on the first search — pairing-mode advertising is
+# easy to miss with a single short window
+INITIAL_SCAN_WINDOW = 30.0
 # After an unexpected drop, keep trying to reconnect for this long
 RECONNECT_WINDOW = 60.0
 
@@ -540,9 +543,23 @@ class ControllerBridge:
             except Exception as e:
                 log.warning("BLE disconnect error: %s", e)
 
+    @staticmethod
+    def _scan_error_message(exc):
+        """Turn a bleak scan failure into an actionable message."""
+        text = str(exc).lower()
+        if "unauthorized" in text or "not authorized" in text or "denied" in text:
+            return (
+                "macOS refused Bluetooth access. Grant it in System Settings → "
+                "Privacy & Security → Bluetooth.\nWhen running from source, the "
+                "permission belongs to Terminal (or your Python), not the app."
+            )
+        if "turned off" in text or "powered off" in text:
+            return "Bluetooth is turned off. Enable it in Control Center and retry."
+        return f"Bluetooth scan failed: {exc}"
+
     async def _connect_async(self):
         was_connected = False
-        deadline = None
+        deadline = time.monotonic() + INITIAL_SCAN_WINDOW
         try:
             while not self._stop_event.is_set():
                 self.is_searching = True
@@ -551,16 +568,15 @@ class ControllerBridge:
                     address, name = await self._find_controller()
                 except Exception as e:
                     log.exception("BLE scan failed")
-                    self.last_error = f"Bluetooth scan failed: {e}"
+                    self.last_error = self._scan_error_message(e)
                     return
-                finally:
-                    self.is_searching = False
 
                 if self._stop_event.is_set():
                     return
 
                 streamed = False
                 if address:
+                    self.is_searching = False
                     streamed = await self._session(
                         address, name, reconnected=was_connected
                     )
@@ -578,22 +594,28 @@ class ControllerBridge:
                     log.info("connection dropped, entering reconnect loop")
                     continue
 
-                if not was_connected:
-                    # First attempt failed outright — surface and stop.
-                    if not address:
-                        self.last_error = (
-                            "Controller not found. Make sure it's on and in pairing mode."
-                        )
+                if address and not was_connected:
+                    # Found it but couldn't connect — surface and stop.
                     return
 
-                if deadline is not None and time.monotonic() > deadline:
-                    self.last_error = "Could not reconnect to the controller."
+                if time.monotonic() > deadline:
+                    self.last_error = (
+                        "Could not reconnect to the controller."
+                        if was_connected else
+                        "Controller not found after 30 s. Hold the small pair "
+                        "button on the back until the LEDs sweep, while the "
+                        "search is running.\nNote: the controller will never "
+                        "appear in System Settings → Bluetooth — watch the "
+                        "menubar instead."
+                    )
                     return
 
+                # keep is_searching set during the pause so the UI doesn't flicker
                 await asyncio.sleep(1.0)
         except asyncio.CancelledError:
             log.info("bridge task cancelled")
         finally:
+            self.is_searching = False
             self.is_reconnecting = False
 
     # --- public API ---
@@ -814,6 +836,8 @@ class Switch2BridgeApp(rumps.App):
     def _on_action(self, _):
         state = self._current_state()
         if state == 'idle':
+            if not self._check_bluetooth():
+                return
             self.bridge.connect()
         elif state != 'stopping':
             self.bridge.disconnect()
@@ -972,6 +996,41 @@ class Switch2BridgeApp(rumps.App):
                     "x-apple.systempreferences:com.apple.preference.security"
                     "?Privacy_Accessibility",
                 ])
+
+    def _check_bluetooth(self):
+        """Return False (and explain) when Bluetooth permission is denied.
+
+        CBManagerAuthorization: 0 not determined (prompt will appear on first
+        scan), 1 restricted, 2 denied, 3 allowed.
+        """
+        try:
+            from CoreBluetooth import CBManager  # ships with bleak's backend
+            auth = int(CBManager.authorization())
+        except Exception:
+            return True  # can't check — let the scan surface any error
+        if auth in (1, 2):
+            log.warning("Bluetooth permission denied (auth=%s)", auth)
+            clicked_ok = rumps.alert(
+                title="Bluetooth Permission Required",
+                message=(
+                    f"macOS is blocking Bluetooth access for {APP_NAME}.\n\n"
+                    "Grant it in:\n"
+                    "System Settings → Privacy & Security → Bluetooth\n\n"
+                    "⚠️ When running from source, the permission belongs to "
+                    "Terminal (or your Python interpreter) — enable that entry, "
+                    "then relaunch."
+                ),
+                ok="Open System Settings",
+                cancel="Later",
+            )
+            if clicked_ok == 1:
+                subprocess.Popen([
+                    "open",
+                    "x-apple.systempreferences:com.apple.preference.security"
+                    "?Privacy_Bluetooth",
+                ])
+            return False
+        return True
 
     def _surface_mappings_messages(self):
         if self.mappings.last_error:
