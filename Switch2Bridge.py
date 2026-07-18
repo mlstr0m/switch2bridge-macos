@@ -66,7 +66,7 @@ except ImportError:
 # ============================================================
 
 APP_NAME = "Switch2 Bridge"
-APP_VERSION = "1.2.2"  # single source of truth — read by setup_app.py & build_dmg.sh
+APP_VERSION = "1.2.3"  # single source of truth — read by setup_app.py & build_dmg.sh
 INPUT_CHAR_UUID = "7492866c-ec3e-4619-8258-32755ffcc0f9"
 
 # Nintendo company identifiers seen in BLE advertisements:
@@ -273,8 +273,10 @@ class Mappings:
             with open(MAPPINGS_FILE) as f:
                 cfg = json.load(f)
         except Exception:
-            log.exception("could not read mappings.json to persist DSU toggle")
-            cfg = json.loads(json.dumps(self.DEFAULT))
+            # Never clobber a corrupt (but user-authored) file with defaults —
+            # the toggle just won't persist until the file is fixed.
+            log.exception("mappings.json unreadable, DSU toggle not persisted")
+            return
         dsu = cfg.get("dsu")
         if not isinstance(dsu, dict):
             dsu = cfg["dsu"] = {}
@@ -596,6 +598,10 @@ class ControllerBridge:
                     streamed = await self._session(
                         address, name, reconnected=was_connected
                     )
+                    if not streamed and was_connected:
+                        # Still auto-retrying — keep the failure in the logs
+                        # only; a notification per attempt would spam the user.
+                        self.last_error = None
 
                 if self._stop_event.is_set():
                     return
@@ -791,7 +797,7 @@ class Switch2BridgeApp(rumps.App):
         elif state == 'connected':
             self.title = "🟢"
             self._status_item.title = f"✓ {self.bridge.controller_name or 'Controller'}"
-            self._detail_item.title = f"   {self.bridge.packet_count} packets"
+            self._detail_item.title = f"   {self.bridge.packet_count} pkts"
             self._action_item.title = "Disconnect"
             self._action_item.set_callback(self._on_action)
         elif state == 'stopping':
