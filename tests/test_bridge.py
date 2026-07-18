@@ -275,6 +275,39 @@ check("powered off -> enable hint", "turned off" in msg, msg)
 msg = S2B.ControllerBridge._scan_error_message(Exception("boom"))
 check("generic passthrough", "boom" in msg, msg)
 
+# discovery filters: both Nintendo company IDs + name fallback
+print("== discovery filters ==")
+class AdvSIG:
+    manufacturer_data = {0x0553: b"\x01\x69\x20\x00"}  # BT SIG assigned ID
+class AdvVID:
+    manufacturer_data = {0x057E: b"\x01\x69\x20\x00"}  # Nintendo USB VID
+class AdvOther:
+    manufacturer_data = {0x004C: b"\x10\x05"}          # random Apple device
+class NoName:
+    name = None
+class Named:
+    name = "Pro Controller (S2)"
+
+MockScanner.queue = []
+MockScanner.delay = 0.01
+br7 = S2B.ControllerBridge(mm)
+
+MockScanner.result = {"S1": (NoName(), AdvSIG())}
+a, n = asyncio.run(br7._find_controller())
+check("SIG id 0x0553 matched (no name)", a == "S1" and n == "Switch 2 Pro Controller", (a, n))
+
+MockScanner.result = {"S2": (NoName(), AdvVID())}
+a, n = asyncio.run(br7._find_controller())
+check("USB VID 0x057e matched", a == "S2")
+
+MockScanner.result = {"S3": (Named(), AdvOther())}
+a, n = asyncio.run(br7._find_controller())
+check("name fallback", a == "S3" and "Pro Controller" in n)
+
+MockScanner.result = {"S4": (NoName(), AdvOther())}
+a, n = asyncio.run(br7._find_controller())
+check("unrelated device ignored", a is None)
+
 print()
 if FAILURES:
     print(f"FAILED: {len(FAILURES)} -> {FAILURES}")

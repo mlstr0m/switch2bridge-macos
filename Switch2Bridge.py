@@ -66,11 +66,13 @@ except ImportError:
 # ============================================================
 
 APP_NAME = "Switch2 Bridge"
-APP_VERSION = "1.2.1"  # single source of truth — read by setup_app.py & build_dmg.sh
+APP_VERSION = "1.2.2"  # single source of truth — read by setup_app.py & build_dmg.sh
 INPUT_CHAR_UUID = "7492866c-ec3e-4619-8258-32755ffcc0f9"
 
-# Bluetooth SIG company identifier for Nintendo
-NINTENDO_COMPANY_ID = 0x057e
+# Nintendo company identifiers seen in BLE advertisements:
+# 0x0553 is the Bluetooth SIG assigned ID, 0x057E is Nintendo's USB VID
+# (both observed in the wild depending on firmware)
+NINTENDO_COMPANY_IDS = (0x0553, 0x057e)
 # Switch 2 Pro Controller product ID 0x2069, little-endian as it appears on the wire
 SWITCH2_PRO_PID_LE = b'\x69\x20'
 
@@ -471,14 +473,28 @@ class ControllerBridge:
     async def _find_controller(self, timeout=SCAN_TIMEOUT):
         """Returns (address, name) or (None, None)."""
         devices = await BleakScanner.discover(timeout=timeout, return_adv=True)
+        seen = []
         for address, (device, adv) in devices.items():
+            mfr = ", ".join(
+                f"{cid:#06x}:{bytes(p).hex()}"
+                for cid, p in adv.manufacturer_data.items()
+            )
+            seen.append(
+                f"{device.name or '?'} rssi={getattr(adv, 'rssi', '?')} [{mfr}]"
+            )
             # Primary: Nintendo company ID is the dict key in bleak's manufacturer_data
-            payload = adv.manufacturer_data.get(NINTENDO_COMPANY_ID)
-            if payload and SWITCH2_PRO_PID_LE in payload:
-                return address, device.name or "Switch 2 Pro Controller"
+            for cid in NINTENDO_COMPANY_IDS:
+                payload = adv.manufacturer_data.get(cid)
+                if payload and SWITCH2_PRO_PID_LE in payload:
+                    return address, device.name or "Switch 2 Pro Controller"
             # Fallback: some macOS BLE stacks expose name without manufacturer data
             if device.name and "Pro Controller" in device.name:
                 return address, device.name
+        # Diagnostic dump: this is what tells us why a controller wasn't matched
+        log.info(
+            "scan: no controller among %d device(s): %s",
+            len(seen), "; ".join(seen[:20]) or "none",
+        )
         return None, None
 
     # --- main async routine ---
@@ -730,6 +746,9 @@ class Switch2BridgeApp(rumps.App):
 
         self._last_state = None
         self._accessibility_checked = False
+        # Short error shown in the dropdown while idle — notifications are
+        # unreliable when running from source, the menu is always visible
+        self._idle_note = None
         self._apply_state('idle')
 
         self._timer = rumps.Timer(self._tick, self.REFRESH_INTERVAL)
@@ -800,6 +819,7 @@ class Switch2BridgeApp(rumps.App):
             err = self.bridge.last_error
             self.bridge.last_error = None
             log.warning("user-visible bridge error: %s", err)
+            self._idle_note = err.splitlines()[0][:70]
             self._notify("Connection failed", err)
 
         if self.bridge.last_notice:
@@ -817,6 +837,8 @@ class Switch2BridgeApp(rumps.App):
         state = self._current_state()
         if state != self._last_state:
             self._apply_state(state)
+        if state == 'idle' and self._idle_note:
+            self._detail_item.title = f"   ⚠️ {self._idle_note}"
         elif state == 'connected':
             # in-place title update — no menu rebuild
             count = self.bridge.packet_count
@@ -838,6 +860,7 @@ class Switch2BridgeApp(rumps.App):
         if state == 'idle':
             if not self._check_bluetooth():
                 return
+            self._idle_note = None
             self.bridge.connect()
         elif state != 'stopping':
             self.bridge.disconnect()
