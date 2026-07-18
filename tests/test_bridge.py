@@ -308,6 +308,40 @@ MockScanner.result = {"S4": (NoName(), AdvOther())}
 a, n = asyncio.run(br7._find_controller())
 check("unrelated device ignored", a is None)
 
+# failing reconnect attempts must not spam last_error; only the final
+# give-up message surfaces
+print("== reconnect error spam ==")
+S2B.INITIAL_SCAN_WINDOW = 10.0
+S2B.RECONNECT_WINDOW = 2.0
+MockScanner.delay = 0.05
+MockScanner.queue = []
+MockScanner.result = {"AA:BB": (Dev(), Adv())}
+br8 = S2B.ControllerBridge(mm)
+br8.connect()
+time.sleep(0.6)
+check("spam test: connected", br8.is_connected)
+
+orig_connect = MockClient.connect
+async def _failing_connect(self):
+    raise RuntimeError("nope")
+MockClient.connect = _failing_connect
+MockClient.instances[-1]._connected = False  # unexpected drop
+time.sleep(1.2)  # several failing reconnect attempts happen here
+check("no error surfaced while retrying", br8.last_error is None, br8.last_error)
+time.sleep(2.5)  # past the (shrunk) reconnect window
+check("final give-up error surfaced",
+      br8.last_error and "reconnect" in br8.last_error.lower(), br8.last_error)
+check("spam test: thread ended", not br8._thread.is_alive())
+MockClient.connect = orig_connect
+
+# a corrupt mappings.json must never be clobbered by the DSU toggle
+print("== dsu toggle vs corrupt file ==")
+S2B.MAPPINGS_FILE.write_text("{broken json")
+m4 = S2B.Mappings()
+m4.set_dsu_enabled(False)
+check("corrupt file untouched", S2B.MAPPINGS_FILE.read_text() == "{broken json")
+check("in-memory toggle still applied", m4.dsu_enabled is False)
+
 print()
 if FAILURES:
     print(f"FAILED: {len(FAILURES)} -> {FAILURES}")
