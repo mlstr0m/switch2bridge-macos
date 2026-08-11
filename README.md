@@ -129,6 +129,8 @@ Each value is either a single character (`"a"`, `"5"`, `"."`), `null` to leave a
 
 The Switch 2's new **C button** is supported as `"C"` (unmapped by default — set it to any key to use it).
 
+The `"ble"` section holds one advanced setting, `input_char`: leave it `null` to auto-detect the controller's input characteristic (the bridge fills it in itself once detected), or set a 128-bit UUID to force one. See [BLE Characteristics](#ble-characteristics).
+
 Invalid JSON falls back to defaults and the menubar surfaces the parse error. Unknown button names or stick directions (typos) are reported via a notification instead of being silently ignored. Two inputs may share the same key: the key is only released once both are released.
 
 ## 🕹️ DSU server — true analog sticks (no driver)
@@ -186,11 +188,20 @@ switch2bridge-macos/
 | `7492866c-ec3e-4619-8258-32755ffcc0f9` | Input reports (notifications) |
 | `7492866c-ec3e-4619-8258-32755ffcc0f8` | Output (LED, rumble — not working) |
 
+Not every controller exposes that input UUID (see [#15](https://github.com/mlstr0m/switch2bridge-macos/issues/15)), so the bridge treats it as a first guess only:
+
+1. the UUID pinned in `mappings.json` (`ble.input_char`), if it is present on the device;
+2. otherwise the documented UUID above;
+3. otherwise it **probes** every other notifiable characteristic — vendor UUIDs first, SIG-assigned ones last — subscribing for 3 s each and keeping the first one that streams reports of at least 11 bytes (enough to decode buttons and both sticks). The winner is written back to `ble.input_char`, so later connections skip the probing.
+
+Every connection also logs the full GATT table (`GATT: N characteristic(s): …`) to `~/Library/Logs/Switch2Bridge/bridge.log` — that line is what a bug report needs when a controller can't be identified.
+
 ## 🩺 Troubleshooting
 
 - **The controller never appears in System Settings → Bluetooth** — that's **expected**, and not a failure. This bridge is a BLE client: there is no system-level pairing, so macOS will never list the controller. The only place to watch is the app's menubar icon (🔍 → 🟢).
 - **"Controller not found"** — make sure the controller is **not paired with a console nearby** (unpair it or put the console to sleep far away). Click **Connect Controller** *first* — the search now runs for 30 s — *then* hold the small pair button on the back until the LEDs sweep back and forth.
 - **No Bluetooth prompt ever appeared (run-from-source)** — the permission belongs to Terminal/Python, not the app. Check `System Settings → Privacy & Security → Bluetooth` and enable Terminal, then relaunch. Without it, scans silently find nothing.
+- **"Characteristic … was not found" / "no readable input characteristic"** — the controller connected but its input-report characteristic isn't where the bridge expects it. Since v1.2.4 the bridge probes the alternatives automatically and remembers what worked, so retry once — and move the sticks while it says it is identifying the controller, in case that revision only reports on change. If it still gives up, the log now contains a `GATT:` line listing every service and characteristic of your controller — attach it to an issue. You can also pin a UUID yourself: `"ble": { "input_char": "…" }` in `mappings.json`.
 - **Menubar says 🟢 connected but inputs don't reach the emulator** — macOS Accessibility permission is missing. Grant it in *System Settings → Privacy & Security → Accessibility*, then relaunch the app. (The app should also pop an alert about this on first launch.)
 - **Logs** — written to `~/Library/Logs/Switch2Bridge/bridge.log`. Open a terminal and `tail -f` it to watch what's happening in real time.
 
