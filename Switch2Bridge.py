@@ -13,6 +13,7 @@ License: MIT
 import asyncio
 import json
 import logging
+import re
 import subprocess
 import sys
 import threading
@@ -66,8 +67,23 @@ except ImportError:
 # ============================================================
 
 APP_NAME = "Switch2 Bridge"
-APP_VERSION = "1.2.3"  # single source of truth — read by setup_app.py & build_dmg.sh
+APP_VERSION = "1.2.4"  # single source of truth — read by setup_app.py & build_dmg.sh
 INPUT_CHAR_UUID = "7492866c-ec3e-4619-8258-32755ffcc0f9"
+
+# Not every controller revision exposes that UUID (issue #15), so it is only the
+# first candidate: when it is absent we probe the other notifiable
+# characteristics and keep the one that actually streams input reports.
+# Characteristics ending with the Bluetooth base UUID are SIG-assigned
+# (battery level, device info…) and are probed last.
+BLE_BASE_UUID_SUFFIX = "-0000-1000-8000-00805f9b34fb"
+# Vendor UUIDs sharing this prefix belong to the same Nintendo block as
+# INPUT_CHAR_UUID — likeliest place for a renumbered input characteristic.
+VENDOR_UUID_PREFIX = "7492866c"
+INPUT_PROBE_TIMEOUT = 3.0   # per candidate: how long to wait for a report
+MAX_INPUT_PROBES = 8        # cap the worst-case identification time
+MIN_REPORT_LEN = 11         # bytes needed to decode buttons + both sticks
+
+ISSUES_URL = "https://github.com/mlstr0m/switch2bridge-macos/issues"
 
 # Nintendo company identifiers seen in BLE advertisements:
 # 0x0553 is the Bluetooth SIG assigned ID, 0x057E is Nintendo's USB VID
@@ -130,10 +146,18 @@ class Mappings:
             "host": "127.0.0.1",
             "port": 26760,
         },
+        # input_char: null = auto-detect. Set a 128-bit UUID to force the
+        # input-report characteristic of an unusual controller revision.
+        "ble": {
+            "input_char": None,
+        },
     }
 
     BUTTON_NAMES = frozenset(DEFAULT["buttons"])
     STICK_DIRECTIONS = frozenset(("up", "down", "left", "right"))
+    UUID_RE = re.compile(
+        r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    )
 
     SPECIAL_KEYS = {
         "<up>": Key.up, "<down>": Key.down,
@@ -158,6 +182,7 @@ class Mappings:
         self.dsu_enabled = True
         self.dsu_host = "127.0.0.1"
         self.dsu_port = 26760
+        self.input_char = None  # None = auto-detect the input characteristic
         # Consumed by the UI tick: error → alert, warning → notification
         self.last_error = None
         self.last_warning = None
@@ -262,30 +287,57 @@ class Mappings:
             port = 26760
         self.dsu_port = port
 
+        ble = cfg.get("ble", {})
+        if not isinstance(ble, dict):
+            raise ValueError('"ble" must be an object')
+        self.input_char = self._parse_uuid(ble.get("input_char"), warnings)
+
         if warnings:
             self.last_warning = "\n".join(warnings)
 
     def set_dsu_enabled(self, enabled):
         """Persist the DSU toggle back into mappings.json (best effort)."""
         self.dsu_enabled = bool(enabled)
+        self._persist("dsu", "enabled", self.dsu_enabled, "DSU toggle")
+
+    def set_input_char(self, uuid):
+        """Remember an auto-detected input characteristic (best effort)."""
+        self.input_char = uuid
+        self._persist("ble", "input_char", uuid, "input characteristic")
+
+    def _persist(self, section, key, value, what):
+        """Write one setting back into mappings.json without touching the rest."""
         try:
             self.ensure_default_file()
             with open(MAPPINGS_FILE) as f:
                 cfg = json.load(f)
         except Exception:
             # Never clobber a corrupt (but user-authored) file with defaults —
-            # the toggle just won't persist until the file is fixed.
-            log.exception("mappings.json unreadable, DSU toggle not persisted")
+            # the setting just won't persist until the file is fixed.
+            log.exception("mappings.json unreadable, %s not persisted", what)
             return
-        dsu = cfg.get("dsu")
-        if not isinstance(dsu, dict):
-            dsu = cfg["dsu"] = {}
-        dsu["enabled"] = self.dsu_enabled
+        target = cfg.get(section)
+        if not isinstance(target, dict):
+            target = cfg[section] = {}
+        target[key] = value
         try:
             with open(MAPPINGS_FILE, "w") as f:
                 json.dump(cfg, f, indent=2)
         except Exception:
-            log.exception("could not write mappings.json to persist DSU toggle")
+            log.exception("could not write mappings.json to persist %s", what)
+
+    @classmethod
+    def _parse_uuid(cls, value, warnings):
+        """None/empty means auto-detect; anything not a UUID is warned about."""
+        if value is None or value == "":
+            return None
+        text = str(value).strip().lower()
+        if cls.UUID_RE.match(text):
+            return text
+        warnings.append(
+            f'"ble.input_char" is not a 128-bit UUID, ignoring: {value!r}'
+        )
+        return None
 
     @classmethod
     def _parse_key(cls, value):
@@ -397,7 +449,7 @@ class ControllerBridge:
     # --- BLE input parser ---
 
     def _on_data(self, sender, data: bytes):
-        if len(data) < 11:
+        if len(data) < MIN_REPORT_LEN:
             return
 
         self.packet_count += 1
@@ -499,6 +551,135 @@ class ControllerBridge:
         )
         return None, None
 
+    # --- input characteristic resolution ---
+
+    @staticmethod
+    def _gatt_chars(client):
+        """[(service_uuid, characteristic)] for every discovered characteristic."""
+        services = getattr(client, "services", None)
+        if services is None:
+            return []
+        raw = getattr(services, "services", None)
+        iterable = raw.values() if isinstance(raw, dict) else services
+        out = []
+        for svc in iterable:
+            svc_uuid = str(getattr(svc, "uuid", "?")).lower()
+            for char in getattr(svc, "characteristics", ()) or ():
+                out.append((svc_uuid, char))
+        return out
+
+    def _log_gatt(self, client):
+        """Dump the GATT table — this is what identifies an unknown revision."""
+        try:
+            entries = [
+                f"{svc}/{str(char.uuid).lower()}"
+                f"[{','.join(getattr(char, 'properties', ()) or ())}]"
+                for svc, char in self._gatt_chars(client)
+            ]
+            log.info(
+                "GATT: %d characteristic(s): %s",
+                len(entries), " ".join(entries) or "none",
+            )
+        except Exception:
+            log.exception("could not dump the GATT table")
+
+    @classmethod
+    def _probe_candidates(cls, client):
+        """Notifiable characteristics, likeliest input reporter first."""
+        vendor_block, vendor, standard = [], [], []
+        for _svc, char in cls._gatt_chars(client):
+            props = {str(p).lower() for p in (getattr(char, "properties", ()) or ())}
+            if not props & {"notify", "indicate"}:
+                continue
+            uuid = str(char.uuid).lower()
+            if uuid == INPUT_CHAR_UUID:
+                continue  # already tried before probing
+            if uuid.endswith(BLE_BASE_UUID_SUFFIX):
+                standard.append(uuid)
+            elif uuid.startswith(VENDOR_UUID_PREFIX):
+                vendor_block.append(uuid)
+            else:
+                vendor.append(uuid)
+        return (vendor_block + vendor + standard)[:MAX_INPUT_PROBES]
+
+    async def _probe_input_char(self, client, uuid):
+        """Subscribe briefly: True if it streams reports we can decode."""
+        loop = asyncio.get_event_loop()
+        got_report = asyncio.Event()
+
+        def _sniff(_sender, data):
+            if len(data) >= MIN_REPORT_LEN:
+                loop.call_soon_threadsafe(got_report.set)
+
+        try:
+            await client.start_notify(uuid, _sniff)
+        except Exception as e:
+            log.info("probe %s: start_notify refused (%s)", uuid, e)
+            return False
+        try:
+            await asyncio.wait_for(got_report.wait(), INPUT_PROBE_TIMEOUT)
+            return True
+        except asyncio.TimeoutError:
+            log.info(
+                "probe %s: no %d+ byte report within %.0f s",
+                uuid, MIN_REPORT_LEN, INPUT_PROBE_TIMEOUT,
+            )
+            return False
+        finally:
+            try:
+                await client.stop_notify(uuid)
+            except Exception as e:
+                log.info("probe %s: stop_notify failed (%s)", uuid, e)
+
+    async def _resolve_input_char(self, client):
+        """UUID of the characteristic streaming input reports, or None.
+
+        Order: the UUID pinned in mappings.json, then the known one, then a
+        probe of every other notifiable characteristic — controller revisions
+        renumber it (issue #15). Sets last_error when nothing works.
+        """
+        present = {str(char.uuid).lower() for _svc, char in self._gatt_chars(client)}
+
+        pinned = self.mappings.input_char
+        if pinned:
+            if pinned in present:
+                log.info("using pinned input characteristic %s", pinned)
+                return pinned
+            log.warning("pinned input characteristic %s absent, re-detecting", pinned)
+
+        if INPUT_CHAR_UUID in present:
+            return INPUT_CHAR_UUID
+
+        candidates = self._probe_candidates(client)
+        log.info(
+            "%s absent — probing %d candidate(s): %s",
+            INPUT_CHAR_UUID, len(candidates), ", ".join(candidates) or "none",
+        )
+        if candidates:
+            # Some firmwares only report on change, so ask for input while
+            # we listen — an idle controller looks like a silent characteristic.
+            self.last_notice = (
+                "Unknown controller revision — identifying it, move the sticks…"
+            )
+        for uuid in candidates:
+            if self._stop_event.is_set():
+                return None
+            if await self._probe_input_char(client, uuid):
+                log.info("adopted input characteristic %s", uuid)
+                # Remember it so the next connect skips the probing entirely.
+                self.mappings.set_input_char(uuid)
+                self.last_notice = f"New controller revision — using {uuid[:8]}…"
+                return uuid
+
+        self.last_error = (
+            "Connected, but no characteristic streamed readable input.\n"
+            "Retry once while moving the sticks — some revisions only report "
+            "on change.\nIf it keeps failing, the controller's BLE services "
+            "were listed in ~/Library/Logs/Switch2Bridge/bridge.log: please "
+            f"attach that log to a report at {ISSUES_URL}."
+        )
+        return None
+
     # --- main async routine ---
 
     async def _session(self, address, name, reconnected=False):
@@ -510,6 +691,7 @@ class ControllerBridge:
         client = BleakClient(address, timeout=CONNECT_TIMEOUT)
         self._client = client
         self.is_connecting = True
+        notifying = None  # UUID we subscribed to, for the teardown below
         try:
             try:
                 await client.connect()
@@ -521,8 +703,14 @@ class ControllerBridge:
                 self.last_error = "Failed to connect to controller."
                 return False
 
+            self._log_gatt(client)
+            input_char = await self._resolve_input_char(client)
+            if input_char is None:
+                return False  # last_error already set
+
             try:
-                await client.start_notify(INPUT_CHAR_UUID, self._on_data)
+                await client.start_notify(input_char, self._on_data)
+                notifying = input_char
             except Exception as e:
                 log.exception("start_notify failed")
                 self.last_error = f"Connection error: {e}"
@@ -550,8 +738,8 @@ class ControllerBridge:
                 self.dsu.set_connected(False)
             self.release_all_keys()
             try:
-                if client.is_connected:
-                    await client.stop_notify(INPUT_CHAR_UUID)
+                if notifying and client.is_connected:
+                    await client.stop_notify(notifying)
             except Exception as e:
                 log.warning("BLE stop_notify error: %s", e)
             try:

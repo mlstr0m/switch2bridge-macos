@@ -204,12 +204,37 @@ br4._thread.join(3)
 check("reconnect after cancel runs", br4.last_error is not None)
 
 # mock full session: device found, client streams then "drops"
+class MockChar:
+    def __init__(self, uuid, properties=("read", "notify")):
+        self.uuid = uuid
+        self.properties = list(properties)
+
+class MockService:
+    def __init__(self, uuid, characteristics):
+        self.uuid = uuid
+        self.characteristics = characteristics
+
+def known_gatt():
+    """GATT table of a controller exposing the documented input characteristic."""
+    return [MockService("7492866c-ec3e-4619-8258-32755ffcc0f0", [
+        MockChar(S2B.INPUT_CHAR_UUID),
+        MockChar("7492866c-ec3e-4619-8258-32755ffcc0f8", ("write",)),
+    ])]
+
 class MockClient:
     instances = []
+    services_template = None   # set per test; None -> known_gatt()
+    streaming = {}             # uuid -> payload emitted while subscribed
     def __init__(self, address, timeout=None):
         self.address = address
         self._connected = False
         self.notify_cb = None
+        self.subscribed = []
+        self.services = (
+            known_gatt() if MockClient.services_template is None
+            else MockClient.services_template
+        )
+        self._feeds = {}
         MockClient.instances.append(self)
     @property
     def is_connected(self):
@@ -220,8 +245,19 @@ class MockClient:
         self._connected = False
     async def start_notify(self, uuid, cb):
         self.notify_cb = cb
+        self.subscribed.append(uuid)
+        payload = MockClient.streaming.get(uuid)
+        if payload is not None:
+            self._feeds[uuid] = asyncio.ensure_future(self._feed(uuid, cb, payload))
     async def stop_notify(self, uuid):
-        pass
+        feed = self._feeds.pop(uuid, None)
+        if feed is not None:
+            feed.cancel()
+    @staticmethod
+    async def _feed(uuid, cb, payload):
+        while True:
+            await asyncio.sleep(0.02)
+            cb(uuid, payload)
 
 S2B.BleakClient = MockClient
 
@@ -307,6 +343,116 @@ check("name fallback", a == "S3" and "Pro Controller" in n)
 MockScanner.result = {"S4": (NoName(), AdvOther())}
 a, n = asyncio.run(br7._find_controller())
 check("unrelated device ignored", a is None)
+
+# ============ input characteristic resolution (issue #15) ============
+print("== input characteristic ==")
+S2B.INPUT_PROBE_TIMEOUT = 0.3   # keep the probing tests fast
+
+BATTERY_CHAR = "00002a19" + S2B.BLE_BASE_UUID_SUFFIX
+ALT_INPUT_CHAR = "7492866c-ec3e-4619-8258-32755ffcc0fa"
+ODD_VENDOR_CHAR = "ab0828b1-198e-4351-b779-901fa0e0371e"
+
+def resolve(services, pinned=None, streaming=None):
+    """Run _resolve_input_char against a fabricated GATT table."""
+    MockClient.services_template = services
+    MockClient.streaming = streaming or {}
+    mres = M()
+    mres._apply(json.loads(json.dumps(M.DEFAULT)))
+    mres.input_char = pinned
+    brr = S2B.ControllerBridge(mres)
+    client = MockClient("XX")
+    async def run():
+        await client.connect()
+        return await brr._resolve_input_char(client)
+    try:
+        return asyncio.run(run()), brr, client
+    finally:
+        MockClient.services_template = None
+        MockClient.streaming = {}
+
+report = packet(b2=0x02)
+
+# known UUID present -> used directly, nothing probed
+uuid, brr, client = resolve(known_gatt())
+check("known char used", uuid == S2B.INPUT_CHAR_UUID, uuid)
+check("known char not probed", client.subscribed == [], client.subscribed)
+
+# pinned UUID wins when present, is ignored when absent
+uuid, _, _ = resolve(
+    [MockService("svc", [MockChar(S2B.INPUT_CHAR_UUID), MockChar(ALT_INPUT_CHAR)])],
+    pinned=ALT_INPUT_CHAR,
+)
+check("pinned char used", uuid == ALT_INPUT_CHAR, uuid)
+uuid, _, _ = resolve(known_gatt(), pinned=ALT_INPUT_CHAR)
+check("stale pin falls back to known char", uuid == S2B.INPUT_CHAR_UUID, uuid)
+
+# renumbered characteristic: probe adopts the one that streams real reports
+uuid, brr, client = resolve(
+    [MockService("svc", [MockChar(BATTERY_CHAR), MockChar(ALT_INPUT_CHAR)])],
+    streaming={ALT_INPUT_CHAR: report, BATTERY_CHAR: b"\x63"},
+)
+check("renumbered char adopted", uuid == ALT_INPUT_CHAR, uuid)
+check("vendor char probed before battery", client.subscribed[0] == ALT_INPUT_CHAR,
+      client.subscribed)
+check("adopted char persisted", brr.mappings.input_char == ALT_INPUT_CHAR)
+check("adoption noticed in UI", brr.last_notice and "revision" in brr.last_notice,
+      brr.last_notice)
+check("no error on success", brr.last_error is None, brr.last_error)
+
+# short reports must not be mistaken for input (battery streams 1 byte)
+uuid, brr, _ = resolve(
+    [MockService("svc", [MockChar(BATTERY_CHAR)])],
+    streaming={BATTERY_CHAR: b"\x63"},
+)
+check("short reports rejected", uuid is None, uuid)
+check("rejection explains next step",
+      brr.last_error and "bridge.log" in brr.last_error and "issues" in brr.last_error,
+      brr.last_error)
+
+# probe order: same vendor block, then other vendor UUIDs, then SIG-assigned
+MockClient.services_template = [MockService("svc", [
+    MockChar(BATTERY_CHAR), MockChar(ODD_VENDOR_CHAR), MockChar(ALT_INPUT_CHAR),
+    MockChar("write-only-char", ("write",)),
+])]
+order = S2B.ControllerBridge._probe_candidates(MockClient("XX"))
+check("probe order", order == [ALT_INPUT_CHAR, ODD_VENDOR_CHAR, BATTERY_CHAR], order)
+check("non-notifiable skipped", "write-only-char" not in order, order)
+MockClient.services_template = None
+
+# a client whose services never got discovered must not crash the resolver
+uuid, brr, _ = resolve([])
+check("empty GATT -> actionable error", uuid is None and brr.last_error, brr.last_error)
+
+# a failed resolution must not spam stop_notify for a subscription we never made
+MockClient.services_template = []
+br_nochar = S2B.ControllerBridge(mm)
+streamed = asyncio.run(br_nochar._session("XX", "Pro Controller"))
+check("session fails cleanly without input char", streamed is False)
+check("no stop_notify attempted", MockClient.instances[-1].subscribed == [],
+      MockClient.instances[-1].subscribed)
+MockClient.services_template = None
+
+# ============ ble.input_char config ============
+print("== ble.input_char config ==")
+warns = []
+check("null -> auto", M._parse_uuid(None, warns) is None and not warns)
+check("uuid normalized",
+      M._parse_uuid("7492866C-EC3E-4619-8258-32755FFCC0FA", warns) == ALT_INPUT_CHAR)
+check("garbage rejected with warning",
+      M._parse_uuid("nope", warns) is None and any("input_char" in w for w in warns),
+      warns)
+
+mcfg = M()
+cfg2 = json.loads(json.dumps(M.DEFAULT))
+cfg2["ble"]["input_char"] = ALT_INPUT_CHAR
+mcfg._apply(cfg2)
+check("config pin applied", mcfg.input_char == ALT_INPUT_CHAR)
+
+S2B.MAPPINGS_FILE.write_text(json.dumps(M.DEFAULT))
+mcfg.set_input_char(ALT_INPUT_CHAR)
+saved = json.loads(S2B.MAPPINGS_FILE.read_text())
+check("input_char persisted", saved["ble"]["input_char"] == ALT_INPUT_CHAR, saved.get("ble"))
+check("persist keeps other sections", saved["buttons"]["A"] == "z" and "dsu" in saved)
 
 # failing reconnect attempts must not spam last_error; only the final
 # give-up message surfaces
