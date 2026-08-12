@@ -69,6 +69,14 @@ except ImportError:
 APP_NAME = "Switch2 Bridge"
 APP_VERSION = "1.2.4"  # single source of truth — read by setup_app.py & build_dmg.sh
 INPUT_CHAR_UUID = "7492866c-ec3e-4619-8258-32755ffcc0f9"
+# …f8 is the *output* (LED/rumble) characteristic on the unit this was
+# reverse-engineered on, but an AU-market controller streams its input reports
+# from it and has no …f9 at all (issue #15) — the two roles are swapped there.
+# Trusted first, probe-validated after, since we know less about its role.
+KNOWN_INPUT_CHAR_UUIDS = (
+    INPUT_CHAR_UUID,
+    "7492866c-ec3e-4619-8258-32755ffcc0f8",
+)
 
 # Not every controller revision exposes that UUID (issue #15), so it is only the
 # first candidate: when it is absent we probe the other notifiable
@@ -583,24 +591,37 @@ class ControllerBridge:
         except Exception:
             log.exception("could not dump the GATT table")
 
+    @staticmethod
+    def _can_notify(char):
+        props = {str(p).lower() for p in (getattr(char, "properties", ()) or ())}
+        return bool(props & {"notify", "indicate"})
+
+    @classmethod
+    def _notifiable_uuids(cls, client):
+        return {
+            str(char.uuid).lower()
+            for _svc, char in cls._gatt_chars(client) if cls._can_notify(char)
+        }
+
     @classmethod
     def _probe_candidates(cls, client):
         """Notifiable characteristics, likeliest input reporter first."""
-        vendor_block, vendor, standard = [], [], []
+        known, vendor_block, vendor, standard = [], [], [], []
         for _svc, char in cls._gatt_chars(client):
-            props = {str(p).lower() for p in (getattr(char, "properties", ()) or ())}
-            if not props & {"notify", "indicate"}:
+            if not cls._can_notify(char):
                 continue
             uuid = str(char.uuid).lower()
             if uuid == INPUT_CHAR_UUID:
-                continue  # already tried before probing
-            if uuid.endswith(BLE_BASE_UUID_SUFFIX):
+                continue  # trusted without probing, before we get here
+            if uuid in KNOWN_INPUT_CHAR_UUIDS:
+                known.append(uuid)
+            elif uuid.endswith(BLE_BASE_UUID_SUFFIX):
                 standard.append(uuid)
             elif uuid.startswith(VENDOR_UUID_PREFIX):
                 vendor_block.append(uuid)
             else:
                 vendor.append(uuid)
-        return (vendor_block + vendor + standard)[:MAX_INPUT_PROBES]
+        return (known + vendor_block + vendor + standard)[:MAX_INPUT_PROBES]
 
     async def _probe_input_char(self, client, uuid):
         """Subscribe briefly: True if it streams reports we can decode."""
@@ -634,20 +655,24 @@ class ControllerBridge:
     async def _resolve_input_char(self, client):
         """UUID of the characteristic streaming input reports, or None.
 
-        Order: the UUID pinned in mappings.json, then the known one, then a
-        probe of every other notifiable characteristic — controller revisions
-        renumber it (issue #15). Sets last_error when nothing works.
+        Order: the UUID pinned in mappings.json, then the documented one, then
+        a probe of every other notifiable characteristic (other known UUIDs
+        first) — controller revisions renumber it (issue #15). Sets last_error
+        when nothing works.
         """
-        present = {str(char.uuid).lower() for _svc, char in self._gatt_chars(client)}
+        notifiable = self._notifiable_uuids(client)
 
         pinned = self.mappings.input_char
         if pinned:
-            if pinned in present:
+            if pinned in notifiable:
                 log.info("using pinned input characteristic %s", pinned)
                 return pinned
-            log.warning("pinned input characteristic %s absent, re-detecting", pinned)
+            log.warning(
+                "pinned input characteristic %s absent or not notifiable, "
+                "re-detecting", pinned,
+            )
 
-        if INPUT_CHAR_UUID in present:
+        if INPUT_CHAR_UUID in notifiable:
             return INPUT_CHAR_UUID
 
         candidates = self._probe_candidates(client)

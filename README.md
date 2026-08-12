@@ -185,14 +185,14 @@ switch2bridge-macos/
 
 | UUID | Purpose |
 |------|---------|
-| `7492866c-ec3e-4619-8258-32755ffcc0f9` | Input reports (notifications) |
-| `7492866c-ec3e-4619-8258-32755ffcc0f8` | Output (LED, rumble — not working) |
+| `7492866c-ec3e-4619-8258-32755ffcc0f9` | Input reports (notifications) — absent on some units |
+| `7492866c-ec3e-4619-8258-32755ffcc0f8` | Output (LED, rumble — not working) — **but input reports on some units** |
 
-Not every controller exposes that input UUID (see [#15](https://github.com/mlstr0m/switch2bridge-macos/issues/15)), so the bridge treats it as a first guess only:
+**The two roles are not fixed.** An AU-market controller in [#15](https://github.com/mlstr0m/switch2bridge-macos/issues/15) has no `…f9` at all and streams its input reports from `…f8`, the UUID that is the output characteristic here. So the bridge resolves the input characteristic at connect time rather than assuming it:
 
-1. the UUID pinned in `mappings.json` (`ble.input_char`), if it is present on the device;
-2. otherwise the documented UUID above;
-3. otherwise it **probes** every other notifiable characteristic — vendor UUIDs first, SIG-assigned ones last — subscribing for 3 s each and keeping the first one that streams reports of at least 11 bytes (enough to decode buttons and both sticks). The winner is written back to `ble.input_char`, so later connections skip the probing.
+1. the UUID pinned in `mappings.json` (`ble.input_char`), if the device exposes it and it can notify;
+2. otherwise `…f9`;
+3. otherwise it **probes** the remaining notifiable characteristics — other known UUIDs (`…f8`) first, then the same Nintendo vendor block, then other vendor UUIDs, SIG-assigned ones (battery…) last. Each candidate is subscribed for up to 3 s and only adopted once it streams a report of at least 11 bytes, enough to decode buttons and both sticks. The winner is written back to `ble.input_char`, so later connections skip the probing.
 
 Every connection also logs the full GATT table (`GATT: N characteristic(s): …`) to `~/Library/Logs/Switch2Bridge/bridge.log` — that line is what a bug report needs when a controller can't be identified.
 
@@ -212,7 +212,7 @@ Every connection also logs the full GATT table (`GATT: N characteristic(s): …`
 | Buttons | ✅ Working | All buttons mapped |
 | C button | 🧪 Experimental | Parsed as byte 4, bit `0x02` — please report if it doesn't fire |
 | Analog Sticks | ✅ Analog via DSU | Full 12-bit analog through the DSU server (Dolphin/Cemu). The keyboard bridge remains digital: thresholded (with hysteresis) to 8 directions (WASD/IJKL). |
-| LED Control | ❌ Not working | Output characteristic doesn't respond |
+| LED Control | ❌ Not working | Output characteristic doesn't respond, so the player LEDs keep sweeping as if still pairing after the bridge connects. Cosmetic: input is unaffected. Since the input/output UUIDs are swapped on some units (see [BLE Characteristics](#ble-characteristics)), the output characteristic has to be resolved per device too — likely on top of a Joy-Con-style handshake |
 | Rumble | ❌ Not working | Same issue |
 | Motion/Gyro | ⚠️ Plumbing ready | DSU motion fields are sent (as zeros) — the gyro bytes in the BLE report are not decoded yet |
 | Native HID | ❌ Not possible | Would require DriverKit (kernel-level) |

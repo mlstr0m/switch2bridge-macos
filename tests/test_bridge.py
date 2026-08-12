@@ -351,6 +351,9 @@ S2B.INPUT_PROBE_TIMEOUT = 0.3   # keep the probing tests fast
 BATTERY_CHAR = "00002a19" + S2B.BLE_BASE_UUID_SUFFIX
 ALT_INPUT_CHAR = "7492866c-ec3e-4619-8258-32755ffcc0fa"
 ODD_VENDOR_CHAR = "ab0828b1-198e-4351-b779-901fa0e0371e"
+# …f8 is documented as the output characteristic but streams input on the
+# controller of issue #15, which has no …f9 at all
+KNOWN_ALT_CHAR = "7492866c-ec3e-4619-8258-32755ffcc0f8"
 
 def resolve(services, pinned=None, streaming=None):
     """Run _resolve_input_char against a fabricated GATT table."""
@@ -399,6 +402,33 @@ check("adoption noticed in UI", brr.last_notice and "revision" in brr.last_notic
       brr.last_notice)
 check("no error on success", brr.last_error is None, brr.last_error)
 
+# issue #15's controller: no …f9, input streams from the documented output UUID
+uuid, brr, client = resolve(
+    [MockService("svc", [MockChar(BATTERY_CHAR), MockChar(KNOWN_ALT_CHAR)])],
+    streaming={KNOWN_ALT_CHAR: report},
+)
+check("known alternate adopted", uuid == KNOWN_ALT_CHAR, uuid)
+check("known alternate probed first", client.subscribed[0] == KNOWN_ALT_CHAR,
+      client.subscribed)
+
+# …f9 present but write-only: fall through to probing instead of failing
+uuid, brr, _ = resolve(
+    [MockService("svc", [
+        MockChar(S2B.INPUT_CHAR_UUID, ("write",)), MockChar(KNOWN_ALT_CHAR),
+    ])],
+    streaming={KNOWN_ALT_CHAR: report},
+)
+check("non-notifiable known char skipped", uuid == KNOWN_ALT_CHAR, uuid)
+
+# a pin that exists but can't notify is ignored too
+uuid, _, _ = resolve(
+    [MockService("svc", [
+        MockChar(ALT_INPUT_CHAR, ("write",)), MockChar(S2B.INPUT_CHAR_UUID),
+    ])],
+    pinned=ALT_INPUT_CHAR,
+)
+check("non-notifiable pin ignored", uuid == S2B.INPUT_CHAR_UUID, uuid)
+
 # short reports must not be mistaken for input (battery streams 1 byte)
 uuid, brr, _ = resolve(
     [MockService("svc", [MockChar(BATTERY_CHAR)])],
@@ -409,13 +439,16 @@ check("rejection explains next step",
       brr.last_error and "bridge.log" in brr.last_error and "issues" in brr.last_error,
       brr.last_error)
 
-# probe order: same vendor block, then other vendor UUIDs, then SIG-assigned
+# probe order: other known UUIDs, then same vendor block, then other vendor
+# UUIDs, then SIG-assigned ones
 MockClient.services_template = [MockService("svc", [
     MockChar(BATTERY_CHAR), MockChar(ODD_VENDOR_CHAR), MockChar(ALT_INPUT_CHAR),
-    MockChar("write-only-char", ("write",)),
+    MockChar(KNOWN_ALT_CHAR), MockChar("write-only-char", ("write",)),
 ])]
 order = S2B.ControllerBridge._probe_candidates(MockClient("XX"))
-check("probe order", order == [ALT_INPUT_CHAR, ODD_VENDOR_CHAR, BATTERY_CHAR], order)
+check("probe order",
+      order == [KNOWN_ALT_CHAR, ALT_INPUT_CHAR, ODD_VENDOR_CHAR, BATTERY_CHAR],
+      order)
 check("non-notifiable skipped", "write-only-char" not in order, order)
 MockClient.services_template = None
 
