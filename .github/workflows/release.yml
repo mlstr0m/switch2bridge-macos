@@ -1,0 +1,69 @@
+name: Release
+
+# Manual: Actions → Release → Run workflow, with the tag (e.g. v1.3.0).
+# Builds the DMG from the selected branch, then creates the tag and the
+# GitHub release, using .github/release-notes/<tag>.md as the body
+# ({{SHA256}} is replaced by the DMG checksum).
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to create, e.g. v1.3.0 (must match APP_VERSION)"
+        required: true
+      title:
+        description: "Release title (defaults to the tag)"
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Check tag, version and notes
+        env:
+          TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(sed -n 's/^APP_VERSION = "\(.*\)".*/\1/p' Switch2Bridge.py)
+          if [ "$TAG" != "v$VERSION" ]; then
+            echo "::error::tag $TAG does not match APP_VERSION $VERSION"; exit 1
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::release $TAG already exists"; exit 1
+          fi
+          test -f ".github/release-notes/$TAG.md" \
+            || { echo "::error::missing .github/release-notes/$TAG.md"; exit 1; }
+
+      - name: Tests
+        run: |
+          pip install -r requirements.txt
+          python tests/test_bridge.py
+          python tests/test_dsu.py
+
+      - name: Build DMG
+        run: ./build_dmg.sh
+
+      - name: Publish release
+        env:
+          TAG: ${{ inputs.tag }}
+          TITLE: ${{ inputs.title }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          DMG="dist/Switch2Bridge-$TAG.dmg"
+          mv dist/Switch2Bridge-Installer.dmg "$DMG"
+          SHA=$(shasum -a 256 "$DMG" | cut -d' ' -f1)
+          echo "SHA-256 $SHA"
+          sed "s/{{SHA256}}/$SHA/" ".github/release-notes/$TAG.md" > notes.md
+          gh release create "$TAG" "$DMG" \
+            --target "$GITHUB_SHA" \
+            --title "${TITLE:-$TAG}" \
+            --notes-file notes.md
