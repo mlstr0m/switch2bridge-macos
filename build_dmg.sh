@@ -38,7 +38,7 @@ fi
 source venv/bin/activate
 
 pip install --upgrade pip -q
-pip install -r requirements.txt -q
+pip install -r requirements-build.txt -q
 
 echo "   ✓ Dependencies installed"
 
@@ -87,8 +87,11 @@ Switch2 Bridge - Installation
 
 1. Drag "Switch2 Bridge" to "Applications"
 
-2. Launch from Applications
-   (Right-click → Open the first time)
+2. Launch from Applications. The app is not notarized, so the
+   first launch is blocked by Gatekeeper:
+   - macOS 15 (Sequoia) and later: System Settings →
+     Privacy & Security → "Open Anyway", then confirm
+   - macOS 13-14: Right-click → Open
 
 3. Grant Bluetooth and Accessibility permissions
    when macOS prompts you
@@ -103,6 +106,9 @@ Ryujinx Configuration:
   A→Z  B→X  X→C  Y→V
   L→Q  R→E  ZL→1  ZR→3
   Sticks: WASD / IJKL
+
+  Default mapping — edit it in
+  ~/Library/Application Support/Switch2Bridge/mappings.json
 README
 
 # Build DMG

@@ -11,11 +11,14 @@ License: MIT
 """
 
 import asyncio
+import ipaddress
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from logging.handlers import RotatingFileHandler
@@ -67,7 +70,7 @@ except ImportError:
 # ============================================================
 
 APP_NAME = "Switch2 Bridge"
-APP_VERSION = "1.2.4"  # single source of truth — read by setup_app.py & build_dmg.sh
+APP_VERSION = "1.3.0"  # single source of truth — read by setup_app.py & build_dmg.sh
 INPUT_CHAR_UUID = "7492866c-ec3e-4619-8258-32755ffcc0f9"
 
 # Not every controller revision exposes that UUID (issue #15), so it is only the
@@ -84,6 +87,34 @@ MAX_INPUT_PROBES = 8        # cap the worst-case identification time
 MIN_REPORT_LEN = 11         # bytes needed to decode buttons + both sticks
 
 ISSUES_URL = "https://github.com/mlstr0m/switch2bridge-macos/issues"
+
+# Command channel (stick calibration read, player LEDs). The characteristic
+# the README used to call "output" (…c0f8) is notify-only; commands go here.
+# UUIDs: https://github.com/ndeadly/switch2_controller_research
+#        (bluetooth_interface.md)
+# Frame format, SPI read and player-light commands, factory calibration
+# addresses and block layout adapted from the fork described in
+# https://github.com/mlstr0m/switch2bridge-macos/issues/14 —
+# https://github.com/kennethreitz/switch2bridge-macos/blob/975f329592a4ef56bd8ac2947d4d148eaf808fe0/controller_commands.py
+# (MIT), itself based on https://github.com/darthcloud/BlueRetro/issues/1249.
+# The addresses match SDL's driver (0x13080 + 0x28, 0x130C0 + 0x28):
+# https://github.com/libsdl-org/SDL/blob/main/src/joystick/hidapi/SDL_hidapi_switch2.c
+COMMAND_CHAR_UUID = "649d4ac9-8eb7-4e6c-af44-1ea54fe5f005"
+RESPONSE_CHAR_UUID = "c765a961-d9d8-4d36-a20a-5315b111836a"
+CMD_FRAME_LEN = 16
+CMD_REQUEST = 0x91
+REPORT_SPI, CMD_SPI_READ = 0x02, 0x04
+REPORT_PLAYER_LIGHTS, CMD_SET_PLAYER_LIGHTS = 0x09, 0x07
+FACTORY_STICK_LEFT = 0x000130A8
+FACTORY_STICK_RIGHT = 0x000130E8
+STICK_BLOCK_LEN = 9
+COMMAND_REPLY_TIMEOUT = 0.8  # per SPI read
+PLAYER_LIGHT_PATTERN = 0x01  # one bit per LED: player 1
+
+# Sticks report 12-bit values; without a factory calibration we keep the
+# nominal centre/half-range the bridge always used.
+STICK_RAW_CENTER = 2048
+STICK_RAW_HALF_RANGE = 2048
 
 # Nintendo company identifiers seen in BLE advertisements:
 # 0x0553 is the Bluetooth SIG assigned ID, 0x057E is Nintendo's USB VID
@@ -104,13 +135,122 @@ CONFIG_DIR = Path.home() / "Library" / "Application Support" / "Switch2Bridge"
 MAPPINGS_FILE = CONFIG_DIR / "mappings.json"
 
 LOG_DIR = Path.home() / "Library" / "Logs" / "Switch2Bridge"
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-_log_handler = RotatingFileHandler(
-    LOG_DIR / "bridge.log", maxBytes=1_000_000, backupCount=2
-)
-_log_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-logging.basicConfig(level=logging.INFO, handlers=[_log_handler])
 log = logging.getLogger(__name__)
+
+
+def setup_logging():
+    """Log to ~/Library/Logs — called at startup, not at import, so importing
+    the module (tests, tools) has no filesystem side effects."""
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    handler = RotatingFileHandler(
+        LOG_DIR / "bridge.log", maxBytes=1_000_000, backupCount=2
+    )
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logging.basicConfig(level=logging.INFO, handlers=[handler])
+
+
+# ============================================================
+# CONTROLLER PROTOCOL — command frames + stick calibration
+# (sources: see COMMAND_CHAR_UUID above)
+# ============================================================
+
+def _command_frame(report_type, command, payload=b""):
+    """<report_type> 0x91 0x00 <command> 0x00 0x08 0x00 0x00 <payload>, 16 bytes."""
+    head = bytes([report_type, CMD_REQUEST, 0x00, command, 0x00, 0x08, 0x00, 0x00])
+    return (head + payload).ljust(CMD_FRAME_LEN, b"\x00")
+
+
+def spi_read_command(address, length):
+    payload = bytes([length, 0x7E, 0x00, 0x00]) + address.to_bytes(4, "little")
+    return _command_frame(REPORT_SPI, CMD_SPI_READ, payload)
+
+
+def player_lights_command(pattern):
+    return _command_frame(
+        REPORT_PLAYER_LIGHTS, CMD_SET_PLAYER_LIGHTS, bytes([pattern & 0x0F])
+    )
+
+
+def parse_spi_reply(reply):
+    """(address, data) for an SPI read reply, else None.
+
+    The result byte (reply[5]) differs between transports/firmwares (0xF8 or
+    0x78), so replies are matched on the echoed address instead.
+    """
+    if len(reply) < CMD_FRAME_LEN or reply[0] != REPORT_SPI or reply[3] != CMD_SPI_READ:
+        return None
+    length = reply[8]
+    address = int.from_bytes(reply[12:16], "little")
+    return address, bytes(reply[CMD_FRAME_LEN:CMD_FRAME_LEN + length])
+
+
+def unpack_12bit_pair(chunk):
+    """Three bytes -> two 12-bit values (the packing the stick reports use)."""
+    return (chunk[0] | ((chunk[1] & 0x0F) << 8),
+            ((chunk[1] & 0xF0) >> 4) | (chunk[2] << 4))
+
+
+def decode_stick_block(data):
+    """Factory calibration block -> (centre, +travel, -travel) as (x, y) pairs.
+
+    Returns None when the block is missing, erased (all 0xFF) or implausible,
+    so a controller without stored calibration keeps the defaults.
+    """
+    if data is None or len(data) < STICK_BLOCK_LEN:
+        return None
+    block = data[:STICK_BLOCK_LEN]
+    if all(b == 0xFF for b in block):
+        return None
+    centre = unpack_12bit_pair(block[0:3])
+    travel_pos = unpack_12bit_pair(block[3:6])
+    travel_neg = unpack_12bit_pair(block[6:9])
+    if not all(1200 < c < 2900 for c in centre):
+        return None
+    if not all(600 < t <= 2048 for t in travel_pos + travel_neg):
+        return None
+    return centre, travel_pos, travel_neg
+
+
+class StickCalibration:
+    """Per-axis centre and per-direction travel (travel is asymmetric)."""
+
+    AXES = ("lx", "ly", "rx", "ry")
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.centers = {a: STICK_RAW_CENTER for a in self.AXES}
+        self.travel_pos = {a: STICK_RAW_HALF_RANGE for a in self.AXES}
+        self.travel_neg = {a: STICK_RAW_HALF_RANGE for a in self.AXES}
+        self.from_factory = False
+
+    def apply_factory(self, left, right):
+        """Adopt decoded blocks (None = keep defaults for that stick)."""
+        applied = []
+        for side, block in (("l", left), ("r", right)):
+            if block is None:
+                continue
+            centre, travel_pos, travel_neg = block
+            for i, coord in enumerate(("x", "y")):
+                axis = side + coord
+                self.centers[axis] = centre[i]
+                self.travel_pos[axis] = travel_pos[i]
+                self.travel_neg[axis] = travel_neg[i]
+                applied.append(axis)
+        if applied:
+            self.from_factory = True
+            log.info("factory stick calibration applied: %s", ", ".join(
+                f"{a}=c{self.centers[a]}/+{self.travel_pos[a]}/-{self.travel_neg[a]}"
+                for a in applied
+            ))
+        return bool(applied)
+
+    def value(self, axis, raw):
+        """Raw 12-bit reading -> [-1.0, 1.0]."""
+        delta = raw - self.centers[axis]
+        span = self.travel_pos[axis] if delta >= 0 else self.travel_neg[axis]
+        return max(-1.0, min(1.0, delta / float(span)))
 
 
 # ============================================================
@@ -193,9 +333,25 @@ class Mappings:
     def ensure_default_file(cls):
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         if not MAPPINGS_FILE.exists():
-            with open(MAPPINGS_FILE, "w") as f:
-                json.dump(cls.DEFAULT, f, indent=2)
+            cls._write_json(cls.DEFAULT)
             log.info("wrote default mappings to %s", MAPPINGS_FILE)
+
+    @staticmethod
+    def _write_json(cfg):
+        """Atomic write: a crash mid-write can never leave a truncated file."""
+        fd, tmp = tempfile.mkstemp(
+            dir=MAPPINGS_FILE.parent, prefix=".mappings-", suffix=".json"
+        )
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(cfg, f, indent=2)
+            os.replace(tmp, MAPPINGS_FILE)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     def load(self):
         """Load mappings from disk, falling back to defaults on error.
@@ -276,8 +432,20 @@ class Mappings:
         dsu = cfg.get("dsu", {})
         if not isinstance(dsu, dict):
             raise ValueError('"dsu" must be an object')
-        self.dsu_enabled = bool(dsu.get("enabled", True))
+        enabled = dsu.get("enabled", True)
+        if not isinstance(enabled, bool):
+            # bool("false") is True — never guess, fall back to the default
+            warnings.append(
+                f'"dsu.enabled" must be true or false, got {enabled!r}; using true'
+            )
+            enabled = True
+        self.dsu_enabled = enabled
         self.dsu_host = str(dsu.get("host", "127.0.0.1"))
+        if not self._is_loopback(self.dsu_host):
+            warnings.append(
+                f"DSU server listens on {self.dsu_host}: other machines on the "
+                "network can read the controller. Use 127.0.0.1 unless intended."
+            )
         try:
             port = int(dsu.get("port", 26760))
         except (TypeError, ValueError):
@@ -321,10 +489,18 @@ class Mappings:
             target = cfg[section] = {}
         target[key] = value
         try:
-            with open(MAPPINGS_FILE, "w") as f:
-                json.dump(cfg, f, indent=2)
+            self._write_json(cfg)
         except Exception:
             log.exception("could not write mappings.json to persist %s", what)
+
+    @staticmethod
+    def _is_loopback(host):
+        if host == "localhost":
+            return True
+        try:
+            return ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            return False  # a hostname: can't tell, so warn
 
     @classmethod
     def _parse_uuid(cls, value, warnings):
@@ -373,13 +549,17 @@ class ControllerBridge:
         self.is_reconnecting = False
         self.controller_name = None
         self.packet_count = 0
-        # Set by worker, read & cleared by the main-thread UI tick
-        self.last_error = None
-        self.last_notice = None
+        self.calibration = StickCalibration()
+        # Set by worker, consumed by the main-thread UI tick via take_*();
+        # the lock makes read-and-clear atomic so no message is lost.
+        self._msg_lock = threading.Lock()
+        self._last_error = None
+        self._last_notice = None
         # Key state: which key each input source holds, and how many sources
         # hold each key (two buttons mapped to the same key must not release
-        # it while one of them is still down).
-        self._key_lock = threading.Lock()
+        # it while one of them is still down). Reentrant: _set_stick_key
+        # holds it across its read of _source_keys and the _set_key call.
+        self._key_lock = threading.RLock()
         self._source_keys = {}   # source name -> key currently held
         self._key_refs = {}      # key -> number of sources holding it
         self._client = None
@@ -387,6 +567,36 @@ class ControllerBridge:
         self._thread = None
         self._loop = None
         self._task = None
+
+    # --- worker -> UI messages ---
+
+    @property
+    def last_error(self):
+        return self._last_error
+
+    @last_error.setter
+    def last_error(self, value):
+        with self._msg_lock:
+            self._last_error = value
+
+    @property
+    def last_notice(self):
+        return self._last_notice
+
+    @last_notice.setter
+    def last_notice(self, value):
+        with self._msg_lock:
+            self._last_notice = value
+
+    def take_error(self):
+        with self._msg_lock:
+            value, self._last_error = self._last_error, None
+        return value
+
+    def take_notice(self):
+        with self._msg_lock:
+            value, self._last_notice = self._last_notice, None
+        return value
 
     # --- key dispatch ---
 
@@ -443,8 +653,9 @@ class ControllerBridge:
         Avoids key chatter when the stick hovers right at the threshold.
         """
         t = self.mappings.stick_threshold
-        held = source in self._source_keys
-        self._set_key(source, key, value > (t * 0.8 if held else t))
+        with self._key_lock:
+            held = source in self._source_keys
+            self._set_key(source, key, value > (t * 0.8 if held else t))
 
     # --- BLE input parser ---
 
@@ -477,12 +688,15 @@ class ControllerBridge:
         self._set_key('-', b.get('-'), b3 & 0x40)
         self._set_key('LS', b.get('LS'), b3 & 0x80)
 
-        # special (byte 4) — 0x02 is believed to be the new C button
+        # special (byte 4): 0x01 Home, 0x02 Capture, 0x04 GR, 0x08 GL, 0x10 C
+        # Sources (all agree): ndeadly/switch2_controller_research
+        # hid_reports.md; esp-cpp/espp PR #765 switch2_pro_report.hpp;
+        # hardware capture in mlstr0m/switch2bridge-macos issue #14.
         self._set_key('HOME', b.get('HOME'), b4 & 0x01)
-        self._set_key('C', b.get('C'), b4 & 0x02)
+        self._set_key('CAPT', b.get('CAPT'), b4 & 0x02)
         self._set_key('GR', b.get('GR'), b4 & 0x04)
         self._set_key('GL', b.get('GL'), b4 & 0x08)
-        self._set_key('CAPT', b.get('CAPT'), b4 & 0x10)
+        self._set_key('C', b.get('C'), b4 & 0x10)
 
         # sticks: 12-bit packed across bytes 5-10
         lx_raw = data[5] | ((data[6] & 0x0F) << 8)
@@ -490,10 +704,12 @@ class ControllerBridge:
         rx_raw = data[8] | ((data[9] & 0x0F) << 8)
         ry_raw = ((data[9] & 0xF0) >> 4) | (data[10] << 4)
 
-        lx = (lx_raw - 2048) / 2048.0
-        ly = (ly_raw - 2048) / 2048.0
-        rx = (rx_raw - 2048) / 2048.0
-        ry = (ry_raw - 2048) / 2048.0
+        # factory calibration when it could be read, nominal range otherwise
+        cal = self.calibration
+        lx = cal.value('lx', lx_raw)
+        ly = cal.value('ly', ly_raw)
+        rx = cal.value('rx', rx_raw)
+        ry = cal.value('ry', ry_raw)
 
         ls = self.mappings.left_stick
         rs = self.mappings.right_stick
@@ -517,7 +733,7 @@ class ControllerBridge:
                     'DDOWN': b3 & 0x01, 'DRIGHT': b3 & 0x02, 'DLEFT': b3 & 0x04,
                     'DUP': b3 & 0x08, 'L': b3 & 0x10, 'ZL': b3 & 0x20,
                     '-': b3 & 0x40, 'LS': b3 & 0x80,
-                    'HOME': b4 & 0x01, 'CAPT': b4 & 0x10,
+                    'HOME': b4 & 0x01, 'CAPT': b4 & 0x02,
                 },
                 lx, ly, rx, ry,
             )
@@ -604,7 +820,7 @@ class ControllerBridge:
 
     async def _probe_input_char(self, client, uuid):
         """Subscribe briefly: True if it streams reports we can decode."""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         got_report = asyncio.Event()
 
         def _sniff(_sender, data):
@@ -680,6 +896,62 @@ class ControllerBridge:
         )
         return None
 
+    # --- command channel: calibration + player LED ---
+
+    async def _configure_controller(self, client):
+        """Read the factory stick calibration and light player LED 1.
+
+        Best effort: a controller that doesn't answer keeps the nominal
+        stick range, and nothing here can fail the connection.
+        """
+        replies = asyncio.Queue()
+
+        def on_reply(_sender, payload):
+            replies.put_nowait(bytes(payload))
+
+        try:
+            await client.start_notify(RESPONSE_CHAR_UUID, on_reply)
+        except Exception as e:
+            log.info("command channel unavailable (%s); nominal stick range", e)
+            return
+
+        async def spi_read(address, length):
+            while not replies.empty():
+                replies.get_nowait()
+            await client.write_gatt_char(
+                COMMAND_CHAR_UUID, spi_read_command(address, length), response=False
+            )
+            for _ in range(3):  # only the reply echoing our address counts
+                try:
+                    reply = await asyncio.wait_for(
+                        replies.get(), COMMAND_REPLY_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    return None
+                parsed = parse_spi_reply(reply)
+                if parsed and parsed[0] == address:
+                    return parsed[1]
+            return None
+
+        try:
+            left = decode_stick_block(
+                await spi_read(FACTORY_STICK_LEFT, STICK_BLOCK_LEN))
+            right = decode_stick_block(
+                await spi_read(FACTORY_STICK_RIGHT, STICK_BLOCK_LEN))
+            if not self.calibration.apply_factory(left, right):
+                log.info("no usable factory stick calibration; nominal range")
+            await client.write_gatt_char(
+                COMMAND_CHAR_UUID, player_lights_command(PLAYER_LIGHT_PATTERN),
+                response=False,
+            )
+        except Exception:  # CancelledError is a BaseException: still propagates
+            log.exception("controller configuration failed; continuing")
+        finally:
+            try:
+                await client.stop_notify(RESPONSE_CHAR_UUID)
+            except Exception:
+                pass
+
     # --- main async routine ---
 
     async def _session(self, address, name, reconnected=False):
@@ -708,6 +980,7 @@ class ControllerBridge:
             if input_char is None:
                 return False  # last_error already set
 
+            self.calibration.reset()  # a different controller may reconnect
             try:
                 await client.start_notify(input_char, self._on_data)
                 notifying = input_char
@@ -725,6 +998,8 @@ class ControllerBridge:
             log.info("connected to %s @ %s", name, address)
             if reconnected:
                 self.last_notice = f"Reconnected to {name}"
+
+            await self._configure_controller(client)
 
             while not self._stop_event.is_set() and client.is_connected:
                 await asyncio.sleep(0.1)
@@ -1009,16 +1284,14 @@ class Switch2BridgeApp(rumps.App):
             self._check_accessibility()
             self._surface_mappings_messages()
 
-        if self.bridge.last_error:
-            err = self.bridge.last_error
-            self.bridge.last_error = None
+        err = self.bridge.take_error()
+        if err:
             log.warning("user-visible bridge error: %s", err)
             self._idle_note = err.splitlines()[0][:70]
             self._notify("Connection failed", err)
 
-        if self.bridge.last_notice:
-            notice = self.bridge.last_notice
-            self.bridge.last_notice = None
+        notice = self.bridge.take_notice()
+        if notice:
             log.info("user-visible bridge notice: %s", notice)
             self._notify("Controller", notice)
 
@@ -1041,6 +1314,8 @@ class Switch2BridgeApp(rumps.App):
             rate = max(0.0, (count - self._rate_prev_count) / elapsed) if elapsed > 0 else 0.0
             self._rate_prev_count, self._rate_prev_time = count, now
             detail = f"   {count} pkts · {rate:.0f}/s"
+            if self.bridge.calibration.from_factory:
+                detail += " · sticks calibrated"
             if self.dsu.running:
                 n = self.dsu.client_count()
                 if n:
@@ -1280,5 +1555,6 @@ if __name__ == "__main__":
     print("   App is running in the menu bar.")
     print(f"   Mappings: {MAPPINGS_FILE}")
     print(f"   Logs:     {LOG_DIR / 'bridge.log'}\n")
+    setup_logging()
     log.info("starting %s", APP_NAME)
     Switch2BridgeApp().run()

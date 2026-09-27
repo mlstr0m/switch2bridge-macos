@@ -86,7 +86,8 @@ class DSUServer:
         self._stop.clear()
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # No SO_REUSEADDR: UDP has no TIME_WAIT to work around, and on
+            # Linux it would let a second server silently share the port.
             sock.bind((self.host, self.port))
             sock.settimeout(1.0)
         except OSError as e:

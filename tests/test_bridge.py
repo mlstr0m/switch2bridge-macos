@@ -138,9 +138,25 @@ check("A press -> z", ("press", "z") in events, events)
 br2._on_data(None, packet(b2=0x00))          # A released
 check("A release -> z up", ("release", "z") in events, events)
 
+# byte 4: 0x01 Home, 0x02 Capture, 0x04 GR, 0x08 GL, 0x10 C — per ndeadly's
+# hid_reports.md, espp PR #765 and the hardware capture in issue #14
+for bit, name, key in ((0x01, "HOME", "h"), (0x02, "CAPT", "o"),
+                       (0x04, "GR", "0"), (0x08, "GL", "9")):
+    events.clear()
+    br2._on_data(None, packet(b4=bit))
+    br2._on_data(None, packet())
+    check(f"byte4 {bit:#04x} -> {name}", events == [("press", key), ("release", key)], events)
+
 events.clear()
-br2._on_data(None, packet(b4=0x02))          # C pressed, unmapped by default
-check("unmapped C -> nothing", events == [], events)
+br2._on_data(None, packet(b4=0x10))          # C pressed, unmapped by default
+br2._on_data(None, packet())
+check("unmapped C (0x10) -> nothing", events == [], events)
+mm.buttons["C"] = "c"
+br2._on_data(None, packet(b4=0x10))
+check("mapped C fires on 0x10", events == [("press", "c")], events)
+br2._on_data(None, packet())
+mm.buttons["C"] = None
+events.clear()
 
 events.clear()
 br2._on_data(None, packet(ly=4000))          # left stick up
@@ -151,7 +167,7 @@ check("stick flip: s pressed", ("press", "s") in events, events)
 
 events.clear()
 br2._on_data(None, b"\x00\x01\x02")          # short packet
-check("short packet ignored", events == [] and br2.packet_count == 5)
+check("short packet ignored", events == [] and br2.packet_count == 16)
 
 # dpad + stick sharing same key
 mm.left_stick["up"] = S2B.Key.up  # same as DUP
@@ -225,10 +241,13 @@ class MockClient:
     instances = []
     services_template = None   # set per test; None -> known_gatt()
     streaming = {}             # uuid -> payload emitted while subscribed
+    flash = {}                 # SPI address -> bytes answered on the command channel
     def __init__(self, address, timeout=None):
         self.address = address
         self._connected = False
         self.notify_cb = None
+        self.response_cb = None
+        self.writes = []
         self.subscribed = []
         self.services = (
             known_gatt() if MockClient.services_template is None
@@ -244,11 +263,27 @@ class MockClient:
     async def disconnect(self):
         self._connected = False
     async def start_notify(self, uuid, cb):
-        self.notify_cb = cb
+        if uuid == S2B.RESPONSE_CHAR_UUID:
+            self.response_cb = cb
+        else:
+            self.notify_cb = cb
         self.subscribed.append(uuid)
         payload = MockClient.streaming.get(uuid)
         if payload is not None:
             self._feeds[uuid] = asyncio.ensure_future(self._feed(uuid, cb, payload))
+    async def write_gatt_char(self, uuid, data, response=True):
+        self.writes.append((uuid, bytes(data)))
+        # emulate SPI read replies from MockClient.flash (address -> bytes)
+        if uuid == S2B.COMMAND_CHAR_UUID and data[0] == S2B.REPORT_SPI:
+            address = int.from_bytes(data[12:16], "little")
+            block = MockClient.flash.get(address)
+            if block is not None and self.response_cb:
+                # layout of the real reply quoted in the fork's PROTOCOL.md
+                # (result byte 0x78 over BLE)
+                head = bytes([0x02, 0x01, 0x00, 0x04, 0x10, 0x78, 0, 0,
+                              len(block), 0, 0, 0]) + address.to_bytes(4, "little")
+                reply = head + block
+                asyncio.get_running_loop().call_soon(self.response_cb, uuid, reply)
     async def stop_notify(self, uuid):
         feed = self._feeds.pop(uuid, None)
         if feed is not None:
@@ -260,6 +295,7 @@ class MockClient:
             cb(uuid, payload)
 
 S2B.BleakClient = MockClient
+S2B.COMMAND_REPLY_TIMEOUT = 0.05   # mock answers instantly or never
 
 class Adv:
     manufacturer_data = {0x057E: b"\x01\x69\x20\xff"}
@@ -487,6 +523,130 @@ m4 = S2B.Mappings()
 m4.set_dsu_enabled(False)
 check("corrupt file untouched", S2B.MAPPINGS_FILE.read_text() == "{broken json")
 check("in-memory toggle still applied", m4.dsu_enabled is False)
+
+# ============ command channel: factory stick calibration ============
+print("== stick calibration ==")
+# Real blocks read from a Pro Controller 2, published in
+# https://github.com/kennethreitz/switch2bridge-macos/blob/975f329592a4ef56bd8ac2947d4d148eaf808fe0/docs/PROTOCOL.md
+LEFT_BLOCK = bytes.fromhex("b347837616612e6664")
+RIGHT_BLOCK = bytes.fromhex("60e884f1f56551f665")
+check("left block decoded",
+      S2B.decode_stick_block(LEFT_BLOCK) == ((1971, 2100), (1654, 1553), (1582, 1606)),
+      S2B.decode_stick_block(LEFT_BLOCK))
+check("right block decoded",
+      S2B.decode_stick_block(RIGHT_BLOCK) == ((2144, 2126), (1521, 1631), (1617, 1631)),
+      S2B.decode_stick_block(RIGHT_BLOCK))
+check("erased block rejected", S2B.decode_stick_block(b"\xff" * 9) is None)
+check("short block rejected", S2B.decode_stick_block(b"\x00" * 4) is None)
+check("implausible block rejected", S2B.decode_stick_block(b"\x00" * 9) is None)
+
+# request frame bytes quoted in PROTOCOL.md (SPI read of 0x1FC040, 11 bytes)
+check("spi read frame",
+      S2B.spi_read_command(0x1FC040, 0x0B)
+      == bytes.fromhex("0291000400080000" "0b7e000040c01f00"),
+      S2B.spi_read_command(0x1FC040, 0x0B).hex())
+check("player lights frame",
+      S2B.player_lights_command(0x01) == bytes.fromhex("0991000700080000" "0100000000000000"))
+reply = bytes.fromhex("0201000410780000" "0b00000040c01f00") + b"\x11" * 11
+check("spi reply parsed (0x78 result byte)",
+      S2B.parse_spi_reply(reply) == (0x1FC040, b"\x11" * 11), S2B.parse_spi_reply(reply))
+check("foreign reply ignored", S2B.parse_spi_reply(b"\x09" + reply[1:]) is None)
+
+cal = S2B.StickCalibration()
+check("nominal range unchanged without calibration",
+      cal.value("lx", 2048) == 0.0 and cal.value("lx", 4095) == 2047 / 2048
+      and cal.value("lx", 0) == -1.0)
+cal.apply_factory(S2B.decode_stick_block(LEFT_BLOCK), None)
+check("full deflection reaches 1.0", cal.value("lx", 1971 + 1654) == 1.0)
+check("asymmetric travel", cal.value("lx", 1971 - 1582) == -1.0)
+check("factory centre reads 0", cal.value("ly", 2100) == 0.0)
+check("clamped past travel", cal.value("lx", 4095) == 1.0)
+check("right stick untouched", cal.value("rx", 2048) == 0.0 and cal.from_factory)
+
+# end-to-end: session reads both blocks, then lights player 1
+MockClient.flash = {S2B.FACTORY_STICK_LEFT: LEFT_BLOCK, S2B.FACTORY_STICK_RIGHT: RIGHT_BLOCK}
+brc = S2B.ControllerBridge(mm)
+async def run_session():
+    task = asyncio.ensure_future(brc._session("XX", "Pro Controller"))
+    await asyncio.sleep(0.3)
+    brc._stop_event.set()
+    return await task
+check("session with calibration streams", asyncio.run(run_session()) is True)
+cl = MockClient.instances[-1]
+check("calibration applied from controller", brc.calibration.from_factory
+      and brc.calibration.centers["rx"] == 2144, brc.calibration.centers)
+check("player LED written", cl.writes and cl.writes[-1]
+      == (S2B.COMMAND_CHAR_UUID, S2B.player_lights_command(0x01)), cl.writes)
+check("response channel unsubscribed", S2B.RESPONSE_CHAR_UUID in cl.subscribed)
+# a later session with a silent controller falls back to the nominal range
+MockClient.flash = {}
+brc._stop_event.clear()
+check("silent controller still streams", asyncio.run(run_session()) is True)
+check("silent controller -> nominal range", not brc.calibration.from_factory)
+
+# DSU feed carries Capture from bit 0x02 (it is DSU's Touch button)
+class FakeDSU:
+    running = True
+    def __init__(self): self.pushed = []
+    def push(self, buttons, *axes): self.pushed.append(buttons)
+fdsu = FakeDSU()
+brd = S2B.ControllerBridge(mm, fdsu)
+brd._on_data(None, packet(b4=0x02))
+brd._on_data(None, packet(b4=0x10))
+check("DSU gets Capture on 0x02", fdsu.pushed[0]["CAPT"] and not fdsu.pushed[1]["CAPT"],
+      fdsu.pushed)
+brd.release_all_keys()
+
+# ============ config hardening ============
+print("== config hardening ==")
+mh = M()
+cfg3 = json.loads(json.dumps(M.DEFAULT))
+cfg3["dsu"]["enabled"] = "false"
+mh._apply(cfg3)
+check("string enabled not truthy", mh.dsu_enabled is True
+      and "dsu.enabled" in (mh.last_warning or ""), mh.last_warning)
+cfg3 = json.loads(json.dumps(M.DEFAULT))
+cfg3["dsu"]["enabled"] = False
+mh.last_warning = None  # load() clears it before _apply()
+mh._apply(cfg3)
+check("bool enabled honoured", mh.dsu_enabled is False and mh.last_warning is None, mh.last_warning)
+cfg3["dsu"]["host"] = "0.0.0.0"
+mh._apply(cfg3)
+check("exposed DSU host warned", "network" in (mh.last_warning or ""), mh.last_warning)
+for host in ("127.0.0.1", "localhost", "::1"):
+    cfg3["dsu"]["host"] = host
+    mh.last_warning = None
+    mh._apply(cfg3)
+    check(f"loopback {host} not warned", mh.last_warning is None, mh.last_warning)
+
+# atomic write leaves no temp file behind and a valid file
+S2B.MAPPINGS_FILE.write_text(json.dumps(M.DEFAULT))
+M().set_dsu_enabled(False)
+leftovers = [p.name for p in S2B.MAPPINGS_FILE.parent.iterdir() if p.name.startswith(".mappings-")]
+check("atomic write: no temp leftovers", leftovers == [], leftovers)
+check("atomic write: valid json", json.loads(S2B.MAPPINGS_FILE.read_text())["dsu"]["enabled"] is False)
+
+# a failing write must keep the previous file intact
+orig_dump = S2B.json.dump
+def _boom(*a, **k):
+    raise OSError("disk full")
+S2B.json.dump = _boom
+M().set_dsu_enabled(True)
+S2B.json.dump = orig_dump
+check("failed write keeps old file", json.loads(S2B.MAPPINGS_FILE.read_text())["dsu"]["enabled"] is False)
+leftovers = [p.name for p in S2B.MAPPINGS_FILE.parent.iterdir() if p.name.startswith(".mappings-")]
+check("failed write cleans temp file", leftovers == [], leftovers)
+
+# worker -> UI messages: take_* returns once, then clears
+brm = S2B.ControllerBridge(mm)
+brm.last_error = "e1"
+brm.last_notice = "n1"
+check("take_error", brm.take_error() == "e1" and brm.take_error() is None)
+check("take_notice", brm.take_notice() == "n1" and brm.last_notice is None)
+
+# importing the module must not touch ~/Library/Logs
+check("no logging handler installed at import",
+      not any(isinstance(h, S2B.RotatingFileHandler) for h in S2B.logging.getLogger().handlers))
 
 print()
 if FAILURES:

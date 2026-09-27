@@ -1,7 +1,7 @@
-# Switch2 Bridge - Dependencies
+# Switch2 Bridge - runtime dependencies (Python 3.10+)
+# Upper bounds on major versions: a new major must be tested before it ships.
 
-bleak>=0.21.0      # BLE connection
-pynput>=1.7.6      # Keyboard simulation
-rumps>=0.4.0       # Menubar app
-py2app>=0.28.0     # Build .app
+bleak>=0.21.0,<4      # BLE connection (3.x requires Python 3.10+)
+pynput>=1.7.6,<2      # Keyboard simulation
+rumps>=0.4.0,<0.5     # Menubar app
 pyobjc-framework-ServiceManagement>=9.0   # "Start at Login" (SMAppService)

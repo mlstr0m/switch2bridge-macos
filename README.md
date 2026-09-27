@@ -6,7 +6,7 @@ A Python menubar app that connects to the Switch 2 Pro Controller via BLE and tr
 
 [![CI](https://github.com/mlstr0m/switch2bridge-macos/actions/workflows/ci.yml/badge.svg)](https://github.com/mlstr0m/switch2bridge-macos/actions/workflows/ci.yml)
 [![macOS](https://img.shields.io/badge/macOS-Ventura%2B-blue?logo=apple)](https://www.apple.com/macos)
-[![Python](https://img.shields.io/badge/Python-3.9%2B-green?logo=python)](https://python.org)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-green?logo=python)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
 ---
@@ -24,11 +24,13 @@ A Python menubar app that connects to the Switch 2 Pro Controller via BLE and tr
 
 - ✅ **Full button mapping** — all buttons, triggers, D-pad working
 - ✅ **Analog sticks** — read with 12-bit precision (converted to 8 directions, see Limitations)
+- ✅ **Factory stick calibration** — read from the controller at connect, so sticks reach full deflection without drift
 - ✅ **Grip buttons** — Switch 2 exclusive GL/GR buttons supported
 - ✅ **Ryujinx compatible** — keyboard bridge for emulator support
 - ✅ **No pairing required** — bypasses macOS Bluetooth limitations
 - ✅ **Auto-reconnect** — if the controller sleeps or drops, the bridge retries for 60 s
-- ✅ **C button** — the Switch 2's new C button can be mapped (experimental)
+- ✅ **C button** — the Switch 2's new C button can be mapped
+- ✅ **Player LED** — player 1 light is set on connect (best effort)
 - ✅ **DSU server (cemuhook)** — true **analog sticks** in Dolphin, Cemu & other DSU clients, no driver needed
 - ✅ **Start at Login** — one click in the menubar (bundled .app, macOS 13+)
 
@@ -47,7 +49,7 @@ This bridge connects via BLE using the `bleak` library, reads the raw input data
 ## 📋 Requirements
 
 - macOS Ventura (13.0) or later
-- Python 3.9+
+- Python 3.10+ (bleak 3 requires it)
 - Nintendo Switch 2 Pro Controller
 
 ## 🔧 Run from source
@@ -79,6 +81,7 @@ chmod +x build_dmg.sh
 The installer lands at `dist/Switch2Bridge-Installer.dmg`. Manual build:
 
 ```bash
+pip install -r requirements-build.txt   # adds py2app
 python setup_app.py py2app
 # → dist/Switch2 Bridge.app
 ```
@@ -157,9 +160,11 @@ switch2bridge-macos/
 ├── dsu_server.py       # DSU (cemuhook) server — analog output for emulators
 ├── setup_app.py        # py2app configuration
 ├── build_dmg.sh        # Automated build script (.app + DMG)
-├── requirements.txt    # Python dependencies
+├── requirements.txt    # Runtime dependencies
+├── requirements-build.txt  # + py2app, for the .app / DMG
 ├── tests/
-│   └── test_bridge.py  # Headless tests (mappings, key dispatch, BLE lifecycle)
+│   ├── test_bridge.py  # Headless tests (mappings, key dispatch, BLE lifecycle, calibration)
+│   └── test_dsu.py     # DSU server over real UDP
 ├── AppIcon.icns        # Application icon (used by py2app)
 ├── LICENSE
 └── README.md
@@ -185,8 +190,29 @@ switch2bridge-macos/
 
 | UUID | Purpose |
 |------|---------|
-| `7492866c-ec3e-4619-8258-32755ffcc0f9` | Input reports (notifications) |
-| `7492866c-ec3e-4619-8258-32755ffcc0f8` | Output (LED, rumble — not working) |
+| `7492866c-ec3e-4619-8258-32755ffcc0f9` | Input reports (notifications) — what the bridge reads |
+| `7492866c-ec3e-4619-8258-32755ffcc0f8` | Also notify-only (read, notify) — it can't be written, which is why LED/rumble never worked through it |
+| `649d4ac9-8eb7-4e6c-af44-1ea54fe5f005` | Command channel (write without response) |
+| `c765a961-d9d8-4d36-a20a-5315b111836a` | Command replies (notifications) |
+
+UUIDs from [ndeadly/switch2_controller_research](https://github.com/ndeadly/switch2_controller_research) (`bluetooth_interface.md`) and the hardware findings in [#14](https://github.com/mlstr0m/switch2bridge-macos/issues/14).
+
+### Input report
+
+| Byte | Content |
+|------|---------|
+| 2 | `0x01` B, `0x02` A, `0x04` Y, `0x08` X, `0x10` R, `0x20` ZR, `0x40` +, `0x80` RS |
+| 3 | `0x01` Down, `0x02` Right, `0x04` Left, `0x08` Up, `0x10` L, `0x20` ZL, `0x40` −, `0x80` LS |
+| 4 | `0x01` Home, `0x02` Capture, `0x04` GR, `0x08` GL, `0x10` C |
+| 5–7 / 8–10 | Left / right stick, two packed 12-bit values each |
+
+Byte 4 follows ndeadly's `hid_reports.md`, [espp's Pro Controller 2 report](https://github.com/esp-cpp/espp/pull/765) and the capture in #14 — up to v1.2.4 the bridge had C and Capture swapped.
+
+### Stick calibration
+
+At connect the bridge reads the controller's factory calibration over the command channel (SPI reads of `0x130A8` for the left stick and `0x130E8` for the right, 9 bytes each: centre, +travel, −travel as packed 12-bit pairs), then lights the player 1 LED. Real travel is only ~1500–1770 counts rather than the nominal 2048, so without it a fully pushed stick tops out around 0.8 in DSU. If the controller doesn't answer, the bridge silently keeps the nominal range; the menubar shows *sticks calibrated* when it worked.
+
+Frame format and addresses come from [kennethreitz's fork](https://github.com/kennethreitz/switch2bridge-macos/blob/975f329592a4ef56bd8ac2947d4d148eaf808fe0/controller_commands.py) (issue #14, MIT), itself based on [BlueRetro #1249](https://github.com/darthcloud/BlueRetro/issues/1249); the addresses match [SDL's Switch 2 driver](https://github.com/libsdl-org/SDL/blob/main/src/joystick/hidapi/SDL_hidapi_switch2.c).
 
 Not every controller exposes that input UUID (see [#15](https://github.com/mlstr0m/switch2bridge-macos/issues/15)), so the bridge treats it as a first guess only:
 
@@ -210,10 +236,10 @@ Every connection also logs the full GATT table (`GATT: N characteristic(s): …`
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Buttons | ✅ Working | All buttons mapped |
-| C button | 🧪 Experimental | Parsed as byte 4, bit `0x02` — please report if it doesn't fire |
-| Analog Sticks | ✅ Analog via DSU | Full 12-bit analog through the DSU server (Dolphin/Cemu). The keyboard bridge remains digital: thresholded (with hysteresis) to 8 directions (WASD/IJKL). |
-| LED Control | ❌ Not working | Output characteristic doesn't respond |
-| Rumble | ❌ Not working | Same issue |
+| C button | ✅ Fixed in v1.3.0 | Byte 4, bit `0x10` (was wrongly read as `0x02`, i.e. Capture, up to v1.2.4) |
+| Analog Sticks | ✅ Analog via DSU | Full 12-bit analog through the DSU server (Dolphin/Cemu), scaled with the controller's factory calibration. The keyboard bridge remains digital: thresholded (with hysteresis) to 8 directions (WASD/IJKL). |
+| LED Control | 🧪 Player 1 only | Set once on connect through the command channel |
+| Rumble | ❌ Not implemented | Goes through the command/vibration channels, not `…c0f8` |
 | Motion/Gyro | ⚠️ Plumbing ready | DSU motion fields are sent (as zeros) — the gyro bytes in the BLE report are not decoded yet |
 | Native HID | ❌ Not possible | Would require DriverKit (kernel-level) |
 
@@ -221,7 +247,7 @@ Every connection also logs the full GATT table (`GATT: N characteristic(s): …`
 
 Contributions welcome! Areas that need work:
 
-1. **LED/Rumble** — figure out the output protocol (likely a Joy-Con-style handshake)
+1. **Rumble** — the command channel is now used for calibration and LEDs; rumble is the next step (see #14)
 2. **Motion controls** — decode gyro/accelerometer data
 3. **True analog** — virtual HID device via DriverKit
 4. **Cross-platform** — Linux/Windows ports
@@ -232,6 +258,8 @@ Contributions welcome! Areas that need work:
 - **Claude (Anthropic)** — development assistance
 - Inspired by [SPro2Win](https://github.com/SquareDonut1/SPro2Win) (Windows)
 - Protocol reference from [Nintendo Switch Reverse Engineering](https://github.com/dekuNukem/Nintendo_Switch_Reverse_Engineering)
+- Switch 2 BLE protocol: [ndeadly/switch2_controller_research](https://github.com/ndeadly/switch2_controller_research), [darthcloud & german77 (BlueRetro #1249)](https://github.com/darthcloud/BlueRetro/issues/1249)
+- C/Capture fix, stick calibration and command channel findings: [issue #14](https://github.com/mlstr0m/switch2bridge-macos/issues/14) and [kennethreitz's fork](https://github.com/kennethreitz/switch2bridge-macos/tree/real-gamepad-output)
 
 ## 📄 License
 

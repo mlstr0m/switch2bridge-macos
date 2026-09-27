@@ -8,14 +8,19 @@ on:
 
 jobs:
   test:
-    name: Headless tests
+    name: Headless tests (Python ${{ matrix.python-version }})
     runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        # oldest supported (bleak 3 needs 3.10+), the one the DMG ships, newest
+        python-version: ["3.10", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
           cache: pip
 
       - name: Install dependencies
