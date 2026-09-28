@@ -499,11 +499,6 @@ class Mappings:
         self.input_char = uuid
         self._persist("ble", "input_char", uuid, "input characteristic")
 
-    def set_address(self, address):
-        """Pin a specific controller address (best effort)."""
-        self.ble_address = address
-        self._persist("ble", "address", address, "BLE address")
-
     def _persist(self, section, key, value, what):
         """Write one setting back into mappings.json without touching the rest."""
         try:

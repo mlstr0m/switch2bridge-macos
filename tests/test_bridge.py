@@ -506,10 +506,6 @@ cfg_addr["ble"]["address"] = "pad-3-addr"
 mcfg_addr._apply(cfg_addr)
 check("config address pin applied", mcfg_addr.ble_address == "pad-3-addr")
 
-S2B.MAPPINGS_FILE.write_text(json.dumps(M.DEFAULT))
-mcfg_addr.set_address("pad-3-addr")
-saved_addr = json.loads(S2B.MAPPINGS_FILE.read_text())
-check("address persisted", saved_addr["ble"]["address"] == "pad-3-addr")
 
 # multi-controller discovery filter by ble.address
 br_multi1 = S2B.ControllerBridge(mcfg_addr)  # pinned to pad-3-addr
@@ -716,7 +712,8 @@ try:
 except SystemExit:
     check("unknown flag rejected", True)
 
-# setup_logging
+# setup_logging — in a temp dir, never the real ~/Library/Logs
+S2B.LOG_DIR = Path(tempfile.mkdtemp())
 log_default = S2B.setup_logging()
 check("default log is bridge.log", log_default == S2B.LOG_DIR / "bridge.log")
 
@@ -726,8 +723,14 @@ check("custom config log is controller2.log", log_custom == S2B.LOG_DIR / "contr
 log_mappings = S2B.setup_logging(Path("mappings.json"))
 check("mappings.json uses bridge.log", log_mappings == S2B.LOG_DIR / "bridge.log")
 
-# restore default logging
-S2B.setup_logging()
+check("log files only in the temp dir",
+      sorted(p.name for p in S2B.LOG_DIR.iterdir()) == ["bridge.log", "controller2.log"],
+      list(S2B.LOG_DIR.iterdir()))
+
+# detach the test handler so nothing keeps logging to a file
+S2B.logging.getLogger().removeHandler(S2B._log_handler)
+S2B._log_handler.close()
+S2B._log_handler = None
 
 print()
 if FAILURES:
