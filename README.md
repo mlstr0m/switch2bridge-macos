@@ -238,12 +238,20 @@ CI runs the same on every pull request (macOS, Python 3.10 / 3.12 / 3.13).
 
 | UUID | Purpose |
 |------|---------|
-| `7492866c-ec3e-4619-8258-32755ffcc0f9` | Input reports (notifications) — what the bridge reads |
-| `7492866c-ec3e-4619-8258-32755ffcc0f8` | Also notify-only (read, notify) — it can't be written, which is why LED/rumble never worked through it |
+| `7492866c-ec3e-4619-8258-32755ffcc0f9` | Input reports (notifications) — absent on some units |
+| `7492866c-ec3e-4619-8258-32755ffcc0f8` | Notify-only (read, notify) — **carries the input reports on units without `…f9`** ([#15](https://github.com/mlstr0m/switch2bridge-macos/issues/15)); it can't be written, which is why LED/rumble never worked through it |
 | `649d4ac9-8eb7-4e6c-af44-1ea54fe5f005` | Command channel (write without response) |
 | `c765a961-d9d8-4d36-a20a-5315b111836a` | Command replies (notifications) |
 
 UUIDs from [ndeadly/switch2_controller_research](https://github.com/ndeadly/switch2_controller_research) (`bluetooth_interface.md`) and the hardware findings in [#14](https://github.com/mlstr0m/switch2bridge-macos/issues/14).
+
+**The input characteristic isn't fixed.** An AU-market controller in [#15](https://github.com/mlstr0m/switch2bridge-macos/issues/15) has no `…f9` at all and streams its input reports from `…f8` (which ndeadly also lists as the Pro Controller input). So the bridge resolves it at connect time rather than assuming it:
+
+1. the UUID pinned in `mappings.json` (`ble.input_char`), if the device exposes it and it can notify;
+2. otherwise `…f9`;
+3. otherwise it **probes** the remaining notifiable characteristics — other known UUIDs (`…f8`) first, then the same Nintendo vendor block, then other vendor UUIDs, SIG-assigned ones (battery…) last. Each candidate is subscribed for up to 3 s and only adopted once it streams a report of at least 11 bytes, enough to decode buttons and both sticks. The winner is written back to `ble.input_char`, so later connections skip the probing.
+
+Every connection also logs the full GATT table (`GATT: N characteristic(s): …`) to `~/Library/Logs/Switch2Bridge/bridge.log` — that line is what a bug report needs when a controller can't be identified.
 
 ### Input report
 
@@ -261,14 +269,6 @@ Byte 4 follows ndeadly's `hid_reports.md`, [espp's Pro Controller 2 report](http
 At connect the bridge reads the controller's factory calibration over the command channel (SPI reads of `0x130A8` for the left stick and `0x130E8` for the right, 9 bytes each: centre, +travel, −travel as packed 12-bit pairs), then lights the player 1 LED. Real travel is only ~1500–1770 counts rather than the nominal 2048, so without it a fully pushed stick tops out around 0.8 in DSU. If the controller doesn't answer, the bridge silently keeps the nominal range; the menubar shows *sticks calibrated* when it worked.
 
 Frame format and addresses come from [kennethreitz's fork](https://github.com/kennethreitz/switch2bridge-macos/blob/975f329592a4ef56bd8ac2947d4d148eaf808fe0/controller_commands.py) (issue #14, MIT), itself based on [BlueRetro #1249](https://github.com/darthcloud/BlueRetro/issues/1249); the addresses match [SDL's Switch 2 driver](https://github.com/libsdl-org/SDL/blob/main/src/joystick/hidapi/SDL_hidapi_switch2.c).
-
-Not every controller exposes that input UUID (see [#15](https://github.com/mlstr0m/switch2bridge-macos/issues/15)), so the bridge treats it as a first guess only:
-
-1. the UUID pinned in `mappings.json` (`ble.input_char`), if it is present on the device;
-2. otherwise the documented UUID above;
-3. otherwise it **probes** every other notifiable characteristic — vendor UUIDs first, SIG-assigned ones last — subscribing for 3 s each and keeping the first one that streams reports of at least 11 bytes (enough to decode buttons and both sticks). The winner is written back to `ble.input_char`, so later connections skip the probing.
-
-Every connection also logs the full GATT table (`GATT: N characteristic(s): …`) to `~/Library/Logs/Switch2Bridge/bridge.log` — that line is what a bug report needs when a controller can't be identified.
 
 ## 🩺 Troubleshooting
 
