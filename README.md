@@ -2,8 +2,11 @@
 
 **The first working Bluetooth LE client for the Nintendo Switch 2 Pro Controller on macOS.**
 
-A Python menubar app that connects to the Switch 2 Pro Controller via BLE and translates inputs to keyboard presses for use with emulators like Ryujinx.
+A menubar app that connects to the Switch 2 Pro Controller via BLE and makes it usable in emulators: as keyboard presses (Ryujinx) or as a true analog gamepad over DSU (Dolphin, Cemu).
 
+**[⬇️ Download the latest release](https://github.com/mlstr0m/switch2bridge-macos/releases/latest)**
+
+[![Release](https://img.shields.io/github/v/release/mlstr0m/switch2bridge-macos)](https://github.com/mlstr0m/switch2bridge-macos/releases/latest)
 [![CI](https://github.com/mlstr0m/switch2bridge-macos/actions/workflows/ci.yml/badge.svg)](https://github.com/mlstr0m/switch2bridge-macos/actions/workflows/ci.yml)
 [![macOS](https://img.shields.io/badge/macOS-Ventura%2B-blue?logo=apple)](https://www.apple.com/macos)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-green?logo=python)](https://python.org)
@@ -18,6 +21,7 @@ A Python menubar app that connects to the Switch 2 Pro Controller via BLE and tr
 **This IS:**
 - ✅ A BLE client that reads controller inputs via Bluetooth Low Energy
 - ✅ A keyboard bridge that converts inputs to key presses for Ryujinx
+- ✅ A DSU (cemuhook) server that exposes the controller as an analog gamepad to Dolphin, Cemu and other DSU clients
 - ✅ A reference implementation for the Switch 2 Pro Controller BLE protocol
 
 ## 🚀 Features
@@ -33,6 +37,7 @@ A Python menubar app that connects to the Switch 2 Pro Controller via BLE and tr
 - ✅ **Player LED** — player 1 light is set on connect (best effort)
 - ✅ **DSU server (cemuhook)** — true **analog sticks** in Dolphin, Cemu & other DSU clients, no driver needed
 - ✅ **Start at Login** — one click in the menubar (bundled .app, macOS 13+)
+- ✅ **Several controllers at once** — one instance per controller with `--config`, each pinned to its pad (see [Multi-controller](#multi-controller-and-multiple-instances))
 
 ## 🤔 Why This Exists
 
@@ -40,7 +45,7 @@ The Nintendo Switch 2 Pro Controller (Product ID: `0x2069`) doesn't work with ma
 
 | Method | Status | Problem |
 |--------|--------|---------|
-| USB | ❌ | Firmware blocks non-Switch connections |
+| USB | ❌ | Stays silent until it receives a proprietary init sequence (not implemented here yet — see [#14](https://github.com/mlstr0m/switch2bridge-macos/issues/14)) |
 | Bluetooth Classic | ❌ | macOS can't discover/pair with it |
 | Bluetooth LE | ✅ | Works with custom BLE client (this project) |
 
@@ -49,8 +54,15 @@ This bridge connects via BLE using the `bleak` library, reads the raw input data
 ## 📋 Requirements
 
 - macOS Ventura (13.0) or later
-- Python 3.10+ (bleak 3 requires it)
 - Nintendo Switch 2 Pro Controller
+- Python 3.10+ only to run from source (bleak 3 requires it)
+
+## 📥 Install
+
+1. Download `Switch2Bridge-vX.Y.Z.dmg` from the [latest release](https://github.com/mlstr0m/switch2bridge-macos/releases/latest) (its SHA-256 is in the release notes)
+2. Open it and drag **Switch2 Bridge** to Applications
+3. First launch: the app isn't notarized, so Gatekeeper blocks it once. On **macOS 15+** go to *System Settings → Privacy & Security → Open Anyway*; on macOS 13–14, right-click the app → **Open**
+4. Grant **Accessibility** at launch and **Bluetooth** on the first *Connect Controller*
 
 ## 🔧 Run from source
 
