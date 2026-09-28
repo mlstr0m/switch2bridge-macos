@@ -184,7 +184,7 @@ class DSUServer:
         while not self._stop.is_set():
             try:
                 data, addr = self._sock.recvfrom(1024)
-            except socket.timeout:
+            except TimeoutError:  # the 1 s recv timeout
                 continue
             except OSError:
                 break  # socket closed
