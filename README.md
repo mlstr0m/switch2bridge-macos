@@ -192,13 +192,31 @@ switch2bridge-macos/
 ├── build_dmg.sh        # Automated build script (.app + DMG)
 ├── requirements.txt    # Runtime dependencies
 ├── requirements-build.txt  # + py2app, for the .app / DMG
+├── ruff.toml           # Lint config
 ├── tests/
-│   ├── test_bridge.py  # Headless tests (mappings, key dispatch, BLE lifecycle, calibration)
+│   ├── test_bridge.py  # Headless tests (mappings, key dispatch, BLE lifecycle, calibration, CLI)
 │   └── test_dsu.py     # DSU server over real UDP
+├── .github/
+│   ├── workflows/ci.yml       # Lint + tests on every PR, DMG build on main
+│   ├── workflows/release.yml  # Manual release: build, tag, publish
+│   └── release-notes/         # One vX.Y.Z.md per release
 ├── AppIcon.icns        # Application icon (used by py2app)
 ├── LICENSE
 └── README.md
 ```
+
+## 🛠️ Development
+
+```bash
+pip install -r requirements.txt
+python tests/test_bridge.py   # headless: BLE and keyboard are mocked
+python tests/test_dsu.py      # real UDP round-trips on localhost
+pip install ruff && ruff check .
+```
+
+CI runs the same on every pull request (macOS, Python 3.10 / 3.12 / 3.13).
+
+**Releasing** — bump `APP_VERSION` in `Switch2Bridge.py` (the single source of truth), add `.github/release-notes/vX.Y.Z.md` (`{{SHA256}}` is replaced by the DMG checksum), merge, then run **Actions → Release → Run workflow** with the tag. It refuses to publish if the tag doesn't match `APP_VERSION` or the release already exists.
 
 ## 🔬 Technical Details
 
@@ -271,7 +289,7 @@ Every connection also logs the full GATT table (`GATT: N characteristic(s): …`
 | LED Control | 🧪 Player 1 only | Set once on connect through the command channel |
 | Rumble | ❌ Not implemented | Goes through the command/vibration channels, not `…c0f8` |
 | Motion/Gyro | ⚠️ Plumbing ready | DSU motion fields are sent (as zeros) — the gyro bytes in the BLE report are not decoded yet |
-| Native HID | ❌ Not possible | Would require DriverKit (kernel-level) |
+| Native HID | ❌ Not implemented | Would need a DriverKit system extension (virtual gamepad), which requires a paid Apple Developer account to sign |
 
 ## 🤝 Contributing
 
@@ -279,7 +297,7 @@ Contributions welcome! Areas that need work:
 
 1. **Rumble** — the command channel is now used for calibration and LEDs; rumble is the next step (see #14)
 2. **Motion controls** — decode gyro/accelerometer data
-3. **True analog** — virtual HID device via DriverKit
+3. **Native gamepad** — virtual HID device via DriverKit, so games see a real controller (analog already works through DSU)
 4. **Cross-platform** — Linux/Windows ports
 
 ## 📜 Credits

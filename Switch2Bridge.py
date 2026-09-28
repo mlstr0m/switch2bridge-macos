@@ -431,7 +431,7 @@ class Mappings:
         try:
             threshold = float(sticks.get("threshold", 0.5))
         except (TypeError, ValueError):
-            raise ValueError('"sticks.threshold" must be a number')
+            raise ValueError('"sticks.threshold" must be a number') from None
         clamped = min(max(threshold, self.THRESHOLD_MIN), self.THRESHOLD_MAX)
         if clamped != threshold:
             warnings.append(f"Stick threshold {threshold} out of range, using {clamped}")
@@ -474,7 +474,7 @@ class Mappings:
         try:
             port = int(dsu.get("port", 26760))
         except (TypeError, ValueError):
-            raise ValueError('"dsu.port" must be an integer')
+            raise ValueError('"dsu.port" must be an integer') from None
         if not (1024 <= port <= 65535):
             warnings.append(f"DSU port {port} out of range, using 26760")
             port = 26760

@@ -137,7 +137,7 @@ try:
     cli.settimeout(0.5)
     cli.recvfrom(1024)
     check("stale client pruned", False, "still receiving")
-except socket.timeout:
+except TimeoutError:
     check("stale client pruned", True)
 check("client_count zero", srv.client_count() == 0)
 

@@ -1,0 +1,5 @@
+target-version = "py310"
+
+[lint]
+# pyflakes, syntax errors, bugbear, pyupgrade
+select = ["F", "E9", "B", "UP"]

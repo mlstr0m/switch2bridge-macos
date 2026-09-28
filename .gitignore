@@ -1,26 +1,22 @@
-# Build & distribution
-dist/
+# Build output (py2app / build_dmg.sh)
 build/
+dist/
 *.spec
 build_py2app.log
 
-# On ignore tous les fichiers de cache Python
-**/__pycache__/
-*.pyc
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+env/
+.ruff_cache/
 
-# Fichiers système macOS
+# macOS
 .DS_Store
 .AppleDouble
 .LSOverride
 
-# Fichiers Python (si tu l'utilises)
-__pycache__/
-*.py[cod]
-*$py.class
-venv/
-.venv/
-env/
-
-# IDE (Visual Studio Code, etc.)
+# Editors
 .vscode/
 .idea/
