@@ -71,7 +71,7 @@ except ImportError:
 # ============================================================
 
 APP_NAME = "Switch2 Bridge"
-APP_VERSION = "1.3.0"  # single source of truth — read by setup_app.py & build_dmg.sh
+APP_VERSION = "1.4.0"  # single source of truth — read by setup_app.py & build_dmg.sh
 INPUT_CHAR_UUID = "7492866c-ec3e-4619-8258-32755ffcc0f9"
 # …f8 streams the input reports of an AU-market controller that has no …f9
 # at all (issue #15); ndeadly/switch2_controller_research also lists it as the
