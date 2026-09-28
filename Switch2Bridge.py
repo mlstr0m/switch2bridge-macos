@@ -10,6 +10,7 @@ Author: Aurélien Desert
 License: MIT
 """
 
+import argparse
 import asyncio
 import ipaddress
 import json
@@ -135,18 +136,37 @@ CONFIG_DIR = Path.home() / "Library" / "Application Support" / "Switch2Bridge"
 MAPPINGS_FILE = CONFIG_DIR / "mappings.json"
 
 LOG_DIR = Path.home() / "Library" / "Logs" / "Switch2Bridge"
-log = logging.getLogger(__name__)
+LOG_FILE = LOG_DIR / "bridge.log"
+_log_handler = None
 
 
-def setup_logging():
+def setup_logging(config_path=None):
     """Log to ~/Library/Logs — called at startup, not at import, so importing
-    the module (tests, tools) has no filesystem side effects."""
+    the module (tests, tools) has no filesystem side effects.
+    Configure rotating log file handler, named after the config file if specified."""
+    global _log_handler, LOG_FILE
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    handler = RotatingFileHandler(
-        LOG_DIR / "bridge.log", maxBytes=1_000_000, backupCount=2
+    if config_path:
+        stem = Path(config_path).stem
+        log_name = f"{stem}.log" if stem != "mappings" else "bridge.log"
+    else:
+        log_name = "bridge.log"
+    LOG_FILE = LOG_DIR / log_name
+
+    root = logging.getLogger()
+    if _log_handler is not None and _log_handler in root.handlers:
+        root.removeHandler(_log_handler)
+        _log_handler.close()
+    _log_handler = RotatingFileHandler(
+        LOG_FILE, maxBytes=1_000_000, backupCount=2
     )
-    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-    logging.basicConfig(level=logging.INFO, handlers=[handler])
+    _log_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    root.addHandler(_log_handler)
+    root.setLevel(logging.INFO)
+    return LOG_FILE
+
+
+log = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -286,10 +306,14 @@ class Mappings:
             "host": "127.0.0.1",
             "port": 26760,
         },
-        # input_char: null = auto-detect. Set a 128-bit UUID to force the
-        # input-report characteristic of an unusual controller revision.
+        # ble:
+        #   input_char: null = auto-detect. Set a 128-bit UUID to force the
+        #               input-report characteristic of an unusual controller revision.
+        #   address:    null = any Switch 2 Pro Controller. Set a BLE address /
+        #               UUID to pin this instance to a specific controller.
         "ble": {
             "input_char": None,
+            "address": None,
         },
     }
 
@@ -323,6 +347,7 @@ class Mappings:
         self.dsu_host = "127.0.0.1"
         self.dsu_port = 26760
         self.input_char = None  # None = auto-detect the input characteristic
+        self.ble_address = None  # None = connect to any matching controller
         # Consumed by the UI tick: error → alert, warning → notification
         self.last_error = None
         self.last_warning = None
@@ -331,7 +356,7 @@ class Mappings:
 
     @classmethod
     def ensure_default_file(cls):
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        MAPPINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
         if not MAPPINGS_FILE.exists():
             cls._write_json(cls.DEFAULT)
             log.info("wrote default mappings to %s", MAPPINGS_FILE)
@@ -459,6 +484,7 @@ class Mappings:
         if not isinstance(ble, dict):
             raise ValueError('"ble" must be an object')
         self.input_char = self._parse_uuid(ble.get("input_char"), warnings)
+        self.ble_address = self._parse_address(ble.get("address"), warnings)
 
         if warnings:
             self.last_warning = "\n".join(warnings)
@@ -472,6 +498,11 @@ class Mappings:
         """Remember an auto-detected input characteristic (best effort)."""
         self.input_char = uuid
         self._persist("ble", "input_char", uuid, "input characteristic")
+
+    def set_address(self, address):
+        """Pin a specific controller address (best effort)."""
+        self.ble_address = address
+        self._persist("ble", "address", address, "BLE address")
 
     def _persist(self, section, key, value, what):
         """Write one setting back into mappings.json without touching the rest."""
@@ -501,6 +532,19 @@ class Mappings:
             return ipaddress.ip_address(host).is_loopback
         except ValueError:
             return False  # a hostname: can't tell, so warn
+
+    @classmethod
+    def _parse_address(cls, value, warnings):
+        """None/empty means auto-detect; non-string warned about."""
+        if value is None or value == "":
+            return None
+        if not isinstance(value, str):
+            warnings.append(
+                f'"ble.address" must be a string or null, ignoring: {value!r}'
+            )
+            return None
+        text = value.strip().lower()
+        return text or None
 
     @classmethod
     def _parse_uuid(cls, value, warnings):
@@ -744,14 +788,17 @@ class ControllerBridge:
         """Returns (address, name) or (None, None)."""
         devices = await BleakScanner.discover(timeout=timeout, return_adv=True)
         seen = []
+        target_addr = (self.mappings.ble_address or "").strip().lower()
         for address, (device, adv) in devices.items():
             mfr = ", ".join(
                 f"{cid:#06x}:{bytes(p).hex()}"
                 for cid, p in adv.manufacturer_data.items()
             )
             seen.append(
-                f"{device.name or '?'} rssi={getattr(adv, 'rssi', '?')} [{mfr}]"
+                f"{device.name or '?'} [{address}] rssi={getattr(adv, 'rssi', '?')} [{mfr}]"
             )
+            if target_addr and address.lower() != target_addr:
+                continue
             # Primary: Nintendo company ID is the dict key in bleak's manufacturer_data
             for cid in NINTENDO_COMPANY_IDS:
                 payload = adv.manufacturer_data.get(cid)
@@ -891,7 +938,7 @@ class ControllerBridge:
             "Connected, but no characteristic streamed readable input.\n"
             "Retry once while moving the sticks — some revisions only report "
             "on change.\nIf it keeps failing, the controller's BLE services "
-            "were listed in ~/Library/Logs/Switch2Bridge/bridge.log: please "
+            f"were listed in {LOG_FILE}: please "
             f"attach that log to a report at {ISSUES_URL}."
         )
         return None
@@ -1550,11 +1597,35 @@ class Switch2BridgeApp(rumps.App):
 # MAIN
 # ============================================================
 
+def _parse_args(argv):
+    parser = argparse.ArgumentParser(
+        prog="Switch2Bridge",
+        description=f"{APP_NAME} — map a Switch 2 Pro Controller to keyboard + DSU.",
+    )
+    parser.add_argument(
+        "--config",
+        metavar="PATH",
+        help="Path to the mappings JSON to load instead of the default "
+             f"({MAPPINGS_FILE}). Created with defaults if it does not exist.",
+    )
+    # macOS launcher / py2app passes -psn_0_XXXXXX (Process Serial Number).
+    # Keep -psn_* out while rejecting any other unknown arguments or typos.
+    clean_argv = [a for a in argv if not (a.startswith("-psn_") or a == "-psn")]
+    return parser.parse_args(clean_argv)
+
+
 if __name__ == "__main__":
+    _args = _parse_args(sys.argv[1:])
+    if _args.config:
+        MAPPINGS_FILE = Path(_args.config).expanduser()
+        CONFIG_DIR = MAPPINGS_FILE.parent
+        setup_logging(MAPPINGS_FILE)
+    else:
+        setup_logging()
+
     print(f"\n🎮 {APP_NAME}")
     print("   App is running in the menu bar.")
     print(f"   Mappings: {MAPPINGS_FILE}")
-    print(f"   Logs:     {LOG_DIR / 'bridge.log'}\n")
-    setup_logging()
+    print(f"   Logs:     {LOG_FILE}\n")
     log.info("starting %s", APP_NAME)
     Switch2BridgeApp().run()

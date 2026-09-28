@@ -132,9 +132,39 @@ Each value is either a single character (`"a"`, `"5"`, `"."`), `null` to leave a
 
 The Switch 2's new **C button** is supported as `"C"` (unmapped by default — set it to any key to use it).
 
-The `"ble"` section holds one advanced setting, `input_char`: leave it `null` to auto-detect the controller's input characteristic (the bridge fills it in itself once detected), or set a 128-bit UUID to force one. See [BLE Characteristics](#ble-characteristics).
+The `"ble"` section holds two advanced settings:
+- `input_char`: leave it `null` to auto-detect the controller's input characteristic (the bridge fills it in itself once detected), or set a 128-bit UUID to force one. See [BLE Characteristics](#ble-characteristics).
+- `address`: leave it `null` to connect to any available Switch 2 Pro Controller, or set a Bluetooth address/UUID to pin this instance to a specific controller (useful for multi-controller setups).
 
 Invalid JSON falls back to defaults and the menubar surfaces the parse error. Unknown button names or stick directions (typos) are reported via a notification instead of being silently ignored. Two inputs may share the same key: the key is only released once both are released.
+
+### Multi-controller and multiple instances
+
+To run multiple controllers simultaneously, launch separate instances of the app with `--config` pointing to different mapping files:
+
+- **From a bundled .app:**
+  ```bash
+  open -n -a "Switch2 Bridge" --args --config ~/Library/Application\ Support/Switch2Bridge/pad2.json
+  ```
+- **From source:**
+  ```bash
+  python Switch2Bridge.py --config ~/Library/Application\ Support/Switch2Bridge/pad2.json
+  ```
+
+If the specified config file does not exist, it is created with defaults.
+
+> [!IMPORTANT]
+> **Avoid port and controller collisions when running multiple instances:**
+> 1. **Per-instance DSU ports:** Every fresh configuration file defaults to DSU port `26760`. Two instances cannot bind to the same UDP port. Edit the second configuration file to use another port (e.g., `"port": 26761`) or disable DSU (`"enabled": false`) on that instance.
+> 2. **Controller assignment (`ble.address`):** By default, an instance connects to the first controller it discovers. To deterministically bind each instance to its own gamepad, pin each controller's Bluetooth address/UUID in its config file:
+>    ```json
+>    "ble": {
+>      "input_char": null,
+>      "address": "B9EA5233-37EF-4DD6-8A31-9EEAE20F78F8"
+>    }
+>    ```
+>    The controller's address is printed in the connection log (`connected to Switch 2 Pro Controller @ <address>`).
+> 3. **Per-instance logs:** Each instance names its log file after the configuration file (e.g. `pad2.log`), so instances do not interfere with each other's logs.
 
 ## 🕹️ DSU server — true analog sticks (no driver)
 
@@ -229,7 +259,7 @@ Every connection also logs the full GATT table (`GATT: N characteristic(s): …`
 - **No Bluetooth prompt ever appeared (run-from-source)** — the permission belongs to Terminal/Python, not the app. Check `System Settings → Privacy & Security → Bluetooth` and enable Terminal, then relaunch. Without it, scans silently find nothing.
 - **"Characteristic … was not found" / "no readable input characteristic"** — the controller connected but its input-report characteristic isn't where the bridge expects it. Since v1.2.4 the bridge probes the alternatives automatically and remembers what worked, so retry once — and move the sticks while it says it is identifying the controller, in case that revision only reports on change. If it still gives up, the log now contains a `GATT:` line listing every service and characteristic of your controller — attach it to an issue. You can also pin a UUID yourself: `"ble": { "input_char": "…" }` in `mappings.json`.
 - **Menubar says 🟢 connected but inputs don't reach the emulator** — macOS Accessibility permission is missing. Grant it in *System Settings → Privacy & Security → Accessibility*, then relaunch the app. (The app should also pop an alert about this on first launch.)
-- **Logs** — written to `~/Library/Logs/Switch2Bridge/bridge.log`. Open a terminal and `tail -f` it to watch what's happening in real time.
+- **Logs** — written to `~/Library/Logs/Switch2Bridge/bridge.log` (or `<config_name>.log` when running with `--config`). Open a terminal and `tail -f` it to watch what's happening in real time.
 
 ## 🚧 Limitations
 
