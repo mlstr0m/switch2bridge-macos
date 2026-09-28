@@ -490,6 +490,50 @@ saved = json.loads(S2B.MAPPINGS_FILE.read_text())
 check("input_char persisted", saved["ble"]["input_char"] == ALT_INPUT_CHAR, saved.get("ble"))
 check("persist keeps other sections", saved["buttons"]["A"] == "z" and "dsu" in saved)
 
+# ============ ble.address config ============
+print("== ble.address config ==")
+warns_addr = []
+check("null address -> None", M._parse_address(None, warns_addr) is None)
+check("empty address -> None", M._parse_address("", warns_addr) is None)
+check("address normalized",
+      M._parse_address("  E2C56DB5-DFFB-48D2-B060-D0F5A71096E0  ", warns_addr) == "e2c56db5-dffb-48d2-b060-d0f5a71096e0")
+check("invalid address type warned",
+      M._parse_address(12345, warns_addr) is None and any("ble.address" in w for w in warns_addr))
+
+mcfg_addr = M()
+cfg_addr = json.loads(json.dumps(M.DEFAULT))
+cfg_addr["ble"]["address"] = "pad-3-addr"
+mcfg_addr._apply(cfg_addr)
+check("config address pin applied", mcfg_addr.ble_address == "pad-3-addr")
+
+S2B.MAPPINGS_FILE.write_text(json.dumps(M.DEFAULT))
+mcfg_addr.set_address("pad-3-addr")
+saved_addr = json.loads(S2B.MAPPINGS_FILE.read_text())
+check("address persisted", saved_addr["ble"]["address"] == "pad-3-addr")
+
+# multi-controller discovery filter by ble.address
+br_multi1 = S2B.ControllerBridge(mcfg_addr)  # pinned to pad-3-addr
+MockScanner.result = {
+    "pad-1-addr": (NoName(), AdvSIG()),
+    "pad-3-addr": (NoName(), AdvVID()),
+}
+a_multi, _ = asyncio.run(br_multi1._find_controller())
+check("pinned address matched specifically", a_multi == "pad-3-addr")
+
+MockScanner.result = {
+    "pad-1-addr": (NoName(), AdvSIG()),
+    "pad-2-addr": (NoName(), AdvVID()),
+}
+a_none, _ = asyncio.run(br_multi1._find_controller())
+check("different address skipped", a_none is None)
+
+# unpinned bridge matches first controller
+mcfg_unpinned = M()
+mcfg_unpinned._apply(json.loads(json.dumps(M.DEFAULT)))
+br_unpinned = S2B.ControllerBridge(mcfg_unpinned)
+a_first, _ = asyncio.run(br_unpinned._find_controller())
+check("unpinned matches first controller", a_first == "pad-1-addr")
+
 # failing reconnect attempts must not spam last_error; only the final
 # give-up message surfaces
 print("== reconnect error spam ==")
@@ -647,6 +691,43 @@ check("take_notice", brm.take_notice() == "n1" and brm.last_notice is None)
 # importing the module must not touch ~/Library/Logs
 check("no logging handler installed at import",
       not any(isinstance(h, S2B.RotatingFileHandler) for h in S2B.logging.getLogger().handlers))
+
+
+# ============ CLI args and logging ============
+print("== _parse_args and setup_logging ==")
+args = S2B._parse_args(["--config", "custom.json"])
+check("parse --config", args.config == "custom.json")
+
+args_psn = S2B._parse_args(["--config", "custom.json", "-psn_0_12345"])
+check("ignore -psn with config", args_psn.config == "custom.json")
+
+args_psn_only = S2B._parse_args(["-psn_0_12345"])
+check("ignore -psn only", args_psn_only.config is None)
+
+try:
+    S2B._parse_args(["--conifg", "typo.json"])
+    check("typo flag rejected", False)
+except SystemExit:
+    check("typo flag rejected", True)
+
+try:
+    S2B._parse_args(["--unknown"])
+    check("unknown flag rejected", False)
+except SystemExit:
+    check("unknown flag rejected", True)
+
+# setup_logging
+log_default = S2B.setup_logging()
+check("default log is bridge.log", log_default == S2B.LOG_DIR / "bridge.log")
+
+log_custom = S2B.setup_logging(Path("controller2.json"))
+check("custom config log is controller2.log", log_custom == S2B.LOG_DIR / "controller2.log")
+
+log_mappings = S2B.setup_logging(Path("mappings.json"))
+check("mappings.json uses bridge.log", log_mappings == S2B.LOG_DIR / "bridge.log")
+
+# restore default logging
+S2B.setup_logging()
 
 print()
 if FAILURES:
